@@ -10,6 +10,21 @@ const pool = new Pool({
   connectionString: process.env.DATABASE_URL || 'postgres://atlas:atlas_pass@localhost:5432/vacation_tracker',
 });
 
+const clients = new Set();
+setInterval(() => { for (const c of clients) c.write(': keepalive\n\n'); }, 25000);
+
+app.get('/api/events', (req, res) => {
+  res.set({
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  res.flushHeaders();
+  clients.add(res);
+  req.on('close', () => clients.delete(res));
+});
+
 async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS app_state (
@@ -37,6 +52,9 @@ app.put('/api/state', async (req, res) => {
        ON CONFLICT (id) DO UPDATE SET data = $1, updated_at = NOW()`,
       [req.body]
     );
+    const clientId = req.headers['x-client-id'] || '';
+    const msg = `data: ${JSON.stringify({ clientId })}\n\n`;
+    for (const c of clients) c.write(msg);
     res.json({ ok: true });
   } catch (e) {
     console.error('PUT /api/state:', e.message);

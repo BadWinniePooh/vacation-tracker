@@ -235,8 +235,10 @@ function App() {
   const [userMenuOpen, setUserMenuOpen] = useState(false);
   const [t, setTweak] = window.useTweaks(TWEAK_DEFAULTS);
   const tr = useI18n(t.language);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
   const saveTimerRef = useRef(null);
   const settingsAppliedRef = useRef(false);
+  const clientIdRef = useRef(Math.random().toString(36).slice(2, 10));
 
   // Load state from API on mount; fall back to localStorage if server unreachable
   useEffect(() => {
@@ -253,7 +255,7 @@ function App() {
     saveTimerRef.current = setTimeout(() => {
       fetch('/api/state', {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', 'X-Client-Id': clientIdRef.current },
         body: JSON.stringify(root),
       }).catch(e => console.warn('Save failed:', e));
     }, 800);
@@ -271,6 +273,21 @@ function App() {
     if (!root) return;
     setRoot(prev => prev ? { ...prev, settings: t } : prev);
   }, [t]);
+
+  // Real-time sync: apply state pushed by other devices
+  useEffect(() => {
+    const es = new EventSource('/api/events');
+    es.onmessage = (e) => {
+      let payload;
+      try { payload = JSON.parse(e.data); } catch { return; }
+      if (payload.clientId === clientIdRef.current) return;
+      fetch('/api/state')
+        .then(r => r.ok ? r.json() : null)
+        .then(d => { if (isValidState(d)) setRoot(d); })
+        .catch(() => {});
+    };
+    return () => es.close();
+  }, []);
 
   // useLayoutEffect so CSS vars are set before child effects (repaintCountries) read them
   useLayoutEffect(() => { applyPalette(t.palette); }, [t.palette]);
@@ -330,6 +347,12 @@ function App() {
   // All hooks above this line — safe to bail out for loading state now
   if (!root) {
     return <div className="app-loading">Loading…</div>;
+  }
+
+  // Selects a city and closes mobile sidebar so the detail panel is visible
+  function selectCity(name) {
+    setSelectedCity(name);
+    if (name != null) setSidebarOpen(false);
   }
 
   // === Root mutators ===
@@ -480,7 +503,7 @@ function App() {
   }
 
   return (
-    <div className="app">
+    <div className="app" data-sidebar={sidebarOpen ? 'open' : 'closed'}>
       <header className="topbar">
         <div className="brand">
           <div className="brand-mark" dangerouslySetInnerHTML={{__html: tr('brand').replace('—', '<em>—</em>')}} />
@@ -511,6 +534,11 @@ function App() {
             onRename={renameUser}
           />
           <button
+            className={`mob-sidebar-btn${sidebarOpen ? ' is-open' : ''}`}
+            aria-label="Toggle city list"
+            onClick={() => setSidebarOpen(o => !o)}
+          >{sidebarOpen ? '✕' : '☰'}</button>
+          <button
             className="settings-btn"
             title="Settings & tweaks"
             onClick={() => window.postMessage({ type: '__activate_edit_mode' }, '*')}
@@ -527,10 +555,10 @@ function App() {
           types={effectiveTypes}
           tr={tr}
           selectedCity={selectedCity}
-          onSelectCity={setSelectedCity}
+          onSelectCity={selectCity}
           onCountryClick={(name) => {
             const c = filteredData.countries[name];
-            if (c && c.cities.length) setSelectedCity(c.cities[0]);
+            if (c && c.cities.length) selectCity(c.cities[0]);
           }}
         />
 
@@ -602,7 +630,7 @@ function App() {
             filter={tab}
             types={effectiveTypes}
             selectedCity={selectedCity}
-            onSelectCity={setSelectedCity}
+            onSelectCity={selectCity}
             onToggleVisited={toggleVisited}
             onRemoveCity={removeCityFromCurrent}
             collapseVisited={t.collapseVisited}
@@ -660,6 +688,10 @@ function App() {
           }
         }} />
       </window.TweaksPanel>
+
+      {sidebarOpen && (
+        <div className="sidebar-backdrop" onClick={() => setSidebarOpen(false)} />
+      )}
     </div>
   );
 }
