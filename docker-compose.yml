@@ -1,0 +1,30 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: vacation_tracker
+      POSTGRES_USER: atlas
+      POSTGRES_PASSWORD: atlas_pass
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U atlas -d vacation_tracker"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgres://atlas:atlas_pass@db:5432/vacation_tracker
+      PORT: 3000
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:

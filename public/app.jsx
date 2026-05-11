@@ -1,0 +1,1236 @@
+// Main React app for Atlas vacation tracker.
+const { useState, useEffect, useRef, useMemo, useCallback } = React;
+
+// === Persistence keys (localStorage fallback only) ===
+const STORAGE_KEY_V4 = 'atlas-vacation-tracker-v4';
+const STORAGE_KEY_V3 = 'atlas-vacation-tracker-v3';
+const STORAGE_KEY_V2 = 'atlas-vacation-tracker-v2';
+const CACHE_KEY = 'atlas-search-cache-v1';
+
+const USER_COLORS = [
+  "oklch(58% 0.14 28)",
+  "oklch(58% 0.14 200)",
+  "oklch(60% 0.13 280)",
+  "oklch(62% 0.14 145)",
+  "oklch(68% 0.13 60)",
+  "oklch(55% 0.16 305)",
+];
+
+const CUSTOM_TYPE_COLORS = [
+  "oklch(65% 0.15 180)",
+  "oklch(60% 0.16 320)",
+  "oklch(70% 0.14 100)",
+  "oklch(55% 0.16 220)",
+  "oklch(65% 0.18 40)",
+  "oklch(50% 0.10 270)",
+];
+const CUSTOM_TYPE_GLYPHS = ["✦","◉","✺","❀","♨","☀","♪","☂","⚑","☘","♛","✈"];
+
+function uid() { return Math.random().toString(36).slice(2, 9); }
+
+function makeUser(name, color) {
+  return { id: uid(), name, color };
+}
+
+// Fallback: read from localStorage (migration path from prototype)
+function loadLocalOrDefault() {
+  try {
+    const raw4 = localStorage.getItem(STORAGE_KEY_V4);
+    if (raw4) return JSON.parse(raw4);
+    const raw3 = localStorage.getItem(STORAGE_KEY_V3);
+    if (raw3) return migrateV3(JSON.parse(raw3));
+    const raw2 = localStorage.getItem(STORAGE_KEY_V2);
+    if (raw2) return migrateV3({
+      currentUser: 'legacy',
+      users: { legacy: { id: 'legacy', name: 'You', color: USER_COLORS[0], data: JSON.parse(raw2) } }
+    });
+  } catch (e) { console.warn('localStorage load failed', e); }
+  return defaultRoot();
+}
+
+function loadCache() {
+  try { return JSON.parse(localStorage.getItem(CACHE_KEY) || '{}'); }
+  catch (e) { return {}; }
+}
+function saveCache(c) {
+  try { localStorage.setItem(CACHE_KEY, JSON.stringify(c)); }
+  catch (e) { /* quota */ }
+}
+
+// Merge per-user v3 stores into a shared v4 store.
+function migrateV3(v3) {
+  const root = {
+    v: 4,
+    currentUser: v3.currentUser,
+    users: {},
+    cities: {},
+    countries: {},
+    customTypes: [],
+  };
+  for (const u of Object.values(v3.users || {})) {
+    root.users[u.id] = { id: u.id, name: u.name, color: u.color };
+    const d = u.data || {};
+    for (const [k, c] of Object.entries(d.cities || {})) {
+      if (!root.cities[k]) {
+        root.cities[k] = { ...c, participants: [u.id] };
+      } else {
+        const e = root.cities[k];
+        root.cities[k] = {
+          ...e,
+          visited: e.visited || c.visited,
+          visitDate: e.visitDate || c.visitDate,
+          notes: e.notes || c.notes,
+          type: e.type || c.type,
+          photos: [...(e.photos || []), ...(c.photos || [])],
+          participants: Array.from(new Set([...(e.participants || []), u.id])),
+        };
+      }
+    }
+  }
+  for (const c of Object.values(root.cities)) {
+    if (!root.countries[c.country]) root.countries[c.country] = { cities: [] };
+    if (!root.countries[c.country].cities.includes(c.name)) {
+      root.countries[c.country].cities.push(c.name);
+    }
+  }
+  return root;
+}
+
+function defaultRoot() {
+  const u = makeUser('You', USER_COLORS[0]);
+  const root = {
+    v: 4,
+    currentUser: u.id,
+    users: { [u.id]: u },
+    cities: {},
+    countries: {},
+    customTypes: [],
+  };
+  const typeMap = {
+    "Paris": "city", "Rome": "cultural", "Florence": "cultural",
+    "Venice": "cultural", "Lisbon": "city", "Tokyo": "city",
+    "Kyoto": "cultural", "Mexico City": "food", "Reykjavik": "nature",
+    "New York": "city",
+  };
+  for (const s of (window.SEED_CITIES || [])) {
+    root.cities[s.name] = {
+      name: s.name, country: s.country,
+      latitude: s.latitude, longitude: s.longitude,
+      visited: !!s.visited, visitDate: s.visitDate || "",
+      notes: s.notes || "", photos: [], type: typeMap[s.name] || "",
+      participants: [u.id],
+    };
+    if (!root.countries[s.country]) root.countries[s.country] = { cities: [] };
+    root.countries[s.country].cities.push(s.name);
+  }
+  return root;
+}
+
+// === Tweaks ===
+const TWEAK_DEFAULTS = /*EDITMODE-BEGIN*/{
+  "palette": "classic",
+  "language": "en",
+  "collapseVisited": false,
+  "colorByType": false
+}/*EDITMODE-END*/;
+
+const PALETTES = {
+  classic: { wanted: "oklch(64% 0.17 28)",  partial: "oklch(75% 0.13 80)",  visited: "oklch(58% 0.14 145)" },
+  pastel:  { wanted: "oklch(75% 0.10 28)",  partial: "oklch(85% 0.09 80)",  visited: "oklch(75% 0.09 145)" },
+  bold:    { wanted: "oklch(55% 0.20 28)",  partial: "oklch(70% 0.18 70)",  visited: "oklch(50% 0.18 145)" },
+  duotone: { wanted: "oklch(55% 0.16 260)", partial: "oklch(65% 0.10 320)", visited: "oklch(60% 0.18 18)" },
+};
+function applyPalette(name) {
+  const p = PALETTES[name] || PALETTES.classic;
+  document.documentElement.style.setProperty('--wanted', p.wanted);
+  document.documentElement.style.setProperty('--partial', p.partial);
+  document.documentElement.style.setProperty('--visited', p.visited);
+}
+
+// === Helpers ===
+function countryVisitedRatio(country, data) {
+  const c = data.countries[country];
+  if (!c || !c.cities.length) return null;
+  const v = c.cities.filter(n => data.cities[n] && data.cities[n].visited).length;
+  return v / c.cities.length;
+}
+function countryColor(ratio) {
+  if (ratio == null) return 'var(--line)';
+  if (ratio <= 0) return 'var(--wanted)';
+  if (ratio >= 1) return 'var(--visited)';
+  if (ratio < 0.5) return `color-mix(in oklch, var(--partial) ${Math.round(ratio*200)}%, var(--wanted))`;
+  return `color-mix(in oklch, var(--visited) ${Math.round((ratio-0.5)*200)}%, var(--partial))`;
+}
+
+// === i18n ===
+function useI18n(lang) {
+  return useCallback((key, ...args) => {
+    const dict = (window.I18N && window.I18N[lang]) || window.I18N.en;
+    const fallback = window.I18N.en;
+    const v = dict[key] ?? fallback[key] ?? key;
+    return typeof v === 'function' ? v(...args) : v;
+  }, [lang]);
+}
+
+// Build the merged list of built-in + user-defined vacation types.
+function useEffectiveTypes(customTypes) {
+  return useMemo(() => {
+    const builtin = window.VACATION_TYPES || [];
+    const custom = (customTypes || []).map(t => ({
+      id: t.id, key: t.id, label: t.label,
+      color: t.color, glyph: t.glyph, _custom: true,
+    }));
+    return [...builtin, ...custom];
+  }, [customTypes]);
+}
+
+// === Nominatim search ===
+async function searchCities(query, lang) {
+  const q = query.trim();
+  if (q.length < 2) return [];
+  const cache = loadCache();
+  const key = lang + ':' + q.toLowerCase();
+  if (cache[key]) return cache[key];
+
+  const url = `https://nominatim.openstreetmap.org/search?` + new URLSearchParams({
+    q, format: 'json', addressdetails: '1', limit: '8',
+    'accept-language': lang === 'de' ? 'de' : 'en',
+  });
+  const res = await fetch(url, { headers: { 'Accept': 'application/json' } });
+  if (!res.ok) throw new Error('Search failed');
+  const raw = await res.json();
+  const allowedTypes = new Set(['city','town','village','administrative','hamlet','municipality','suburb']);
+  const allowedClasses = new Set(['place','boundary']);
+  const seen = new Set();
+  const results = [];
+  for (const r of raw) {
+    if (!allowedClasses.has(r.class) || !allowedTypes.has(r.type)) continue;
+    const a = r.address || {};
+    const name = a.city || a.town || a.village || a.municipality || a.hamlet ||
+      (r.display_name || '').split(',')[0].trim();
+    const country = a.country;
+    if (!name || !country) continue;
+    const id = name + '|' + country;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    results.push({ name, country, latitude: parseFloat(r.lat), longitude: parseFloat(r.lon) });
+  }
+  cache[key] = results;
+  saveCache(cache);
+  return results;
+}
+
+// === App ===
+function App() {
+  const [root, setRoot] = useState(null);
+  const [tab, setTab] = useState('plan');
+  const [selectedCity, setSelectedCity] = useState(null);
+  const [lightboxSrc, setLightboxSrc] = useState(null);
+  const [typeFilter, setTypeFilter] = useState(null);
+  const [userMenuOpen, setUserMenuOpen] = useState(false);
+  const [t, setTweak] = window.useTweaks(TWEAK_DEFAULTS);
+  const tr = useI18n(t.language);
+  const saveTimerRef = useRef(null);
+
+  // Load state from API on mount; fall back to localStorage if server unreachable
+  useEffect(() => {
+    fetch('/api/state')
+      .then(r => r.ok ? r.json() : null)
+      .then(data => setRoot(data || loadLocalOrDefault()))
+      .catch(() => setRoot(loadLocalOrDefault()));
+  }, []);
+
+  // Debounced save to Postgres via API
+  useEffect(() => {
+    if (!root) return;
+    clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = setTimeout(() => {
+      fetch('/api/state', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(root),
+      }).catch(e => console.warn('Save failed:', e));
+    }, 800);
+  }, [root]);
+
+  useEffect(() => { applyPalette(t.palette); }, [t.palette]);
+  useEffect(() => { document.documentElement.lang = t.language; }, [t.language]);
+
+  if (!root) {
+    return <div className="app-loading">Loading…</div>;
+  }
+
+  const currentUser = root.users[root.currentUser];
+  const customTypes = root.customTypes || [];
+  const effectiveTypes = useEffectiveTypes(customTypes);
+
+  useEffect(() => {
+    if (currentUser) {
+      document.documentElement.style.setProperty('--user-accent', currentUser.color);
+    }
+  }, [currentUser?.color]);
+
+  // Visible cities = those where currentUser is a participant.
+  const data = useMemo(() => {
+    const cities = {};
+    const countries = {};
+    if (!currentUser) return { cities, countries };
+    for (const [k, c] of Object.entries(root.cities || {})) {
+      if ((c.participants || []).includes(currentUser.id)) {
+        cities[k] = c;
+        if (!countries[c.country]) countries[c.country] = { cities: [] };
+        countries[c.country].cities.push(c.name);
+      }
+    }
+    return { cities, countries };
+  }, [root.cities, currentUser?.id]);
+
+  const stats = useMemo(() => {
+    const cities = Object.values(data.cities);
+    const cv = cities.filter(c => c.visited).length;
+    const countries = Object.keys(data.countries);
+    const cnv = countries.filter(c => countryVisitedRatio(c, data) === 1).length;
+    return { cities: { v: cv, t: cities.length }, countries: { v: cnv, t: countries.length } };
+  }, [data]);
+
+  // === Root mutators ===
+  function patchRoot(fn) { setRoot(prev => fn(prev)); }
+
+  // === User mutators ===
+  function addUser(name) {
+    setRoot(prev => {
+      const used = new Set(Object.values(prev.users).map(u => u.color));
+      const color = USER_COLORS.find(c => !used.has(c)) || USER_COLORS[Object.keys(prev.users).length % USER_COLORS.length];
+      const u = makeUser(name || 'New traveller', color);
+      return { ...prev, currentUser: u.id, users: { ...prev.users, [u.id]: u } };
+    });
+    setSelectedCity(null);
+  }
+  function removeUser(id) {
+    setRoot(prev => {
+      const ids = Object.keys(prev.users);
+      if (ids.length <= 1) { alert(tr('cantRemoveLast')); return prev; }
+      const users = { ...prev.users }; delete users[id];
+      const cities = {};
+      for (const [k, c] of Object.entries(prev.cities || {})) {
+        const p = (c.participants || []).filter(x => x !== id);
+        if (p.length > 0) cities[k] = { ...c, participants: p };
+      }
+      const countries = {};
+      for (const c of Object.values(cities)) {
+        if (!countries[c.country]) countries[c.country] = { cities: [] };
+        countries[c.country].cities.push(c.name);
+      }
+      const nextCurrent = prev.currentUser === id ? Object.keys(users)[0] : prev.currentUser;
+      return { ...prev, currentUser: nextCurrent, users, cities, countries };
+    });
+    setSelectedCity(null);
+  }
+  function renameUser(id, name) {
+    setRoot(prev => ({ ...prev, users: { ...prev.users, [id]: { ...prev.users[id], name } } }));
+  }
+  function switchUser(id) {
+    setRoot(prev => ({ ...prev, currentUser: id }));
+    setSelectedCity(null);
+    setUserMenuOpen(false);
+  }
+
+  // === City mutators (shared store) ===
+  function rebuildCountries(cities) {
+    const countries = {};
+    for (const c of Object.values(cities)) {
+      if (!countries[c.country]) countries[c.country] = { cities: [] };
+      if (!countries[c.country].cities.includes(c.name)) countries[c.country].cities.push(c.name);
+    }
+    return countries;
+  }
+  function addCity(rec) {
+    patchRoot(prev => {
+      const existingKey = Object.keys(prev.cities).find(k =>
+        prev.cities[k].name === rec.name && prev.cities[k].country === rec.country);
+      if (existingKey) {
+        const c = prev.cities[existingKey];
+        if ((c.participants || []).includes(prev.currentUser)) return prev;
+        const cities = { ...prev.cities, [existingKey]: { ...c, participants: [...(c.participants || []), prev.currentUser] } };
+        return { ...prev, cities, countries: rebuildCountries(cities) };
+      }
+      let displayName = rec.name;
+      if (prev.cities[displayName] && prev.cities[displayName].country !== rec.country) {
+        displayName = `${rec.name}, ${rec.country}`;
+      }
+      const city = {
+        name: displayName, country: rec.country,
+        latitude: rec.latitude, longitude: rec.longitude,
+        visited: false, visitDate: "", notes: "", photos: [], type: "",
+        participants: [prev.currentUser],
+      };
+      const cities = { ...prev.cities, [displayName]: city };
+      return { ...prev, cities, countries: rebuildCountries(cities) };
+    });
+  }
+  function removeCityFromCurrent(name) {
+    patchRoot(prev => {
+      const c = prev.cities[name]; if (!c) return prev;
+      const p = (c.participants || []).filter(x => x !== prev.currentUser);
+      const cities = { ...prev.cities };
+      if (p.length === 0) delete cities[name];
+      else cities[name] = { ...c, participants: p };
+      return { ...prev, cities, countries: rebuildCountries(cities) };
+    });
+    if (selectedCity === name) setSelectedCity(null);
+  }
+  function updateCity(name, patch) {
+    patchRoot(prev => {
+      const c = prev.cities[name]; if (!c) return prev;
+      return { ...prev, cities: { ...prev.cities, [name]: { ...c, ...patch } } };
+    });
+  }
+  function toggleVisited(name) {
+    const c = data.cities[name]; if (!c) return;
+    updateCity(name, {
+      visited: !c.visited,
+      visitDate: !c.visited && !c.visitDate ? new Date().toISOString().slice(0, 7) : c.visitDate,
+    });
+  }
+  function addPhoto(name, dataUrl) {
+    const c = data.cities[name]; if (!c) return;
+    updateCity(name, { photos: [...(c.photos || []), { id: Date.now() + Math.random(), src: dataUrl }] });
+  }
+  function removePhoto(name, photoId) {
+    const c = data.cities[name]; if (!c) return;
+    updateCity(name, { photos: (c.photos || []).filter(p => p.id !== photoId) });
+  }
+  function toggleParticipant(cityName, userId) {
+    const c = root.cities[cityName]; if (!c) return;
+    const p = c.participants || [];
+    const has = p.includes(userId);
+    if (has && p.length === 1) { alert(tr('cantRemoveLastParticipant')); return; }
+    if (has && userId === root.currentUser) {
+      if (!confirm(tr('confirmRemoveSelf'))) return;
+    }
+    const np = has ? p.filter(x => x !== userId) : [...p, userId];
+    patchRoot(prev => {
+      const cities = { ...prev.cities, [cityName]: { ...prev.cities[cityName], participants: np } };
+      return { ...prev, cities, countries: rebuildCountries(cities) };
+    });
+    if (has && userId === root.currentUser && selectedCity === cityName) setSelectedCity(null);
+  }
+
+  // === Custom type mutators ===
+  function addCustomType(rec) {
+    patchRoot(prev => {
+      const id = 'custom-' + uid();
+      const ct = { id, label: rec.label, color: rec.color, glyph: rec.glyph };
+      return { ...prev, customTypes: [...(prev.customTypes || []), ct] };
+    });
+  }
+  function removeCustomType(id) {
+    patchRoot(prev => {
+      const cities = { ...prev.cities };
+      for (const k of Object.keys(cities)) {
+        if (cities[k].type === id) cities[k] = { ...cities[k], type: "" };
+      }
+      return { ...prev, customTypes: (prev.customTypes || []).filter(t => t.id !== id), cities };
+    });
+  }
+  function updateCustomType(id, patch) {
+    patchRoot(prev => ({
+      ...prev,
+      customTypes: (prev.customTypes || []).map(t => t.id === id ? { ...t, ...patch } : t),
+    }));
+  }
+
+  const selected = selectedCity ? data.cities[selectedCity] : null;
+
+  // Filtered cities for map (by type filter)
+  const filteredData = useMemo(() => {
+    if (!typeFilter) return data;
+    const cities = {};
+    for (const [k, c] of Object.entries(data.cities)) {
+      const ct = c.type || "";
+      if (typeFilter === "_none" ? !ct : ct === typeFilter) cities[k] = c;
+    }
+    const countries = {};
+    for (const c of Object.values(cities)) {
+      if (!countries[c.country]) countries[c.country] = { cities: [] };
+      countries[c.country].cities.push(c.name);
+    }
+    return { cities, countries };
+  }, [data, typeFilter]);
+
+  return (
+    <div className="app">
+      <header className="topbar">
+        <div className="brand">
+          <div className="brand-mark" dangerouslySetInnerHTML={{__html: tr('brand').replace('—', '<em>—</em>')}} />
+          <div className="brand-tag">{tr('tag')}</div>
+        </div>
+
+        <div className="topbar-right">
+          <div className="stats">
+            <div className="stat">
+              <div className="stat-value">{stats.cities.v}<span className="frac">/{stats.cities.t}</span></div>
+              <div className="stat-label">{tr('statCities')}</div>
+            </div>
+            <div className="stat">
+              <div className="stat-value">{stats.countries.v}<span className="frac">/{stats.countries.t}</span></div>
+              <div className="stat-label">{tr('statCountries')}</div>
+            </div>
+          </div>
+          <UserSwitcher
+            tr={tr}
+            users={root.users}
+            currentUser={currentUser}
+            open={userMenuOpen}
+            onToggle={() => setUserMenuOpen(o => !o)}
+            onClose={() => setUserMenuOpen(false)}
+            onSwitch={switchUser}
+            onAdd={addUser}
+            onRemove={removeUser}
+            onRename={renameUser}
+          />
+        </div>
+      </header>
+
+      <div className="map-wrap">
+        <div id="map"></div>
+        <window.WorldMap
+          state={filteredData}
+          palette={t.palette}
+          colorByType={t.colorByType}
+          types={effectiveTypes}
+          tr={tr}
+          selectedCity={selectedCity}
+          onSelectCity={setSelectedCity}
+          onCountryClick={(name) => {
+            const c = filteredData.countries[name];
+            if (c && c.cities.length) setSelectedCity(c.cities[0]);
+          }}
+        />
+
+        <div className="map-legend">
+          <div className="legend-title">{tr('legendTitle')}</div>
+          <div className="legend-bar"></div>
+          <div className="legend-labels">
+            <span>{tr('legend0')}</span>
+            <span>{tr('legend100')}</span>
+          </div>
+          {!t.colorByType && (<>
+            <div className="legend-row"><span className="legend-swatch" style={{background:'var(--visited)'}}></span> {tr('legendVisited')}</div>
+            <div className="legend-row"><span className="legend-swatch" style={{background:'var(--wanted)'}}></span> {tr('legendWanted')}</div>
+          </>)}
+          {t.colorByType && (
+            <div className="legend-types">
+              {effectiveTypes.map(vt => (
+                <div key={vt.id} className="legend-row">
+                  <span className="legend-swatch" style={{background: vt.color}}></span>
+                  {vt._custom ? vt.label : tr(vt.key)}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {selected && (
+          <DetailPanel
+            tr={tr}
+            city={selected}
+            users={root.users}
+            currentUserId={root.currentUser}
+            types={effectiveTypes}
+            customTypes={customTypes}
+            onClose={() => setSelectedCity(null)}
+            onToggleVisited={() => toggleVisited(selected.name)}
+            onUpdate={(patch) => updateCity(selected.name, patch)}
+            onAddPhoto={(d) => addPhoto(selected.name, d)}
+            onRemovePhoto={(id) => removePhoto(selected.name, id)}
+            onRemove={() => removeCityFromCurrent(selected.name)}
+            onOpenPhoto={(src) => setLightboxSrc(src)}
+            onToggleParticipant={(uid) => toggleParticipant(selected.name, uid)}
+            onAddCustomType={addCustomType}
+          />
+        )}
+      </div>
+
+      <aside className="sidebar">
+        <div className="side-tabs">
+          <button className={`side-tab ${tab === 'plan' ? 'active' : ''}`} onClick={() => setTab('plan')}>{tr('tabPlan')}</button>
+          <button className={`side-tab ${tab === 'visited' ? 'active' : ''}`} onClick={() => setTab('visited')}>{tr('tabVisited')}</button>
+          <button className={`side-tab ${tab === 'all' ? 'active' : ''}`} onClick={() => setTab('all')}>{tr('tabAll')}</button>
+        </div>
+        <div className="side-body">
+          <CityComposer tr={tr} lang={t.language} onAdd={addCity} existing={data.cities} />
+          <TypeFilter
+            tr={tr}
+            types={effectiveTypes}
+            value={typeFilter}
+            counts={countByType(data.cities)}
+            onChange={setTypeFilter}
+          />
+          <CountryList
+            tr={tr}
+            data={filteredData}
+            allCities={root.cities}
+            users={root.users}
+            currentUserId={root.currentUser}
+            filter={tab}
+            types={effectiveTypes}
+            selectedCity={selectedCity}
+            onSelectCity={setSelectedCity}
+            onToggleVisited={toggleVisited}
+            onRemoveCity={removeCityFromCurrent}
+            collapseVisited={t.collapseVisited}
+          />
+        </div>
+      </aside>
+
+      {lightboxSrc && (
+        <div className="lightbox" onClick={() => setLightboxSrc(null)}>
+          <img src={lightboxSrc} alt="" />
+        </div>
+      )}
+
+      <window.TweaksPanel title="Tweaks">
+        <window.TweakSection label={tr('tweaksLanguage')} />
+        <window.TweakRadio
+          label={tr('tweaksLanguageLabel')}
+          value={t.language}
+          options={[{ value: 'en', label: 'English' }, { value: 'de', label: 'Deutsch' }]}
+          onChange={(v) => setTweak('language', v)}
+        />
+        <window.TweakSection label={tr('tweaksMapPalette')} />
+        <window.TweakSelect
+          label={tr('tweaksColorScheme')}
+          value={t.palette}
+          onChange={(v) => setTweak('palette', v)}
+          options={Object.keys(PALETTES).map(k => ({ value: k, label: tr('pal' + k[0].toUpperCase() + k.slice(1)) }))}
+        />
+        <window.TweakToggle
+          label={tr('vacationType') + ' → ' + tr('legendVisited').toLowerCase()}
+          value={t.colorByType}
+          onChange={(v) => setTweak('colorByType', v)}
+        />
+        <window.TweakSection label={tr('customTypes')} />
+        <CustomTypeManager
+          tr={tr}
+          customTypes={customTypes}
+          onAdd={addCustomType}
+          onRemove={removeCustomType}
+          onUpdate={updateCustomType}
+        />
+        <window.TweakSection label={tr('tweaksSidebar')} />
+        <window.TweakToggle
+          label={tr('tweaksCollapse')}
+          value={t.collapseVisited}
+          onChange={(v) => setTweak('collapseVisited', v)}
+        />
+        <window.TweakSection label={tr('tweaksData')} />
+        <window.TweakButton label={tr('tweaksReset')} secondary onClick={() => {
+          if (confirm(tr('confirmReset'))) setRoot(defaultRoot());
+        }} />
+        <window.TweakButton label={tr('tweaksClear')} secondary onClick={() => {
+          if (confirm(tr('confirmClear'))) {
+            patchRoot(prev => ({ ...prev, cities: {}, countries: {} }));
+          }
+        }} />
+      </window.TweaksPanel>
+    </div>
+  );
+}
+
+function countByType(cities) {
+  const out = { _all: 0, _none: 0 };
+  for (const c of Object.values(cities)) {
+    out._all++;
+    const k = c.type || "_none";
+    out[k] = (out[k] || 0) + 1;
+  }
+  return out;
+}
+
+// === User Switcher ===
+function UserSwitcher({ tr, users, currentUser, open, onToggle, onClose, onSwitch, onAdd, onRemove, onRename }) {
+  const [renaming, setRenaming] = useState(null);
+  const [newName, setNewName] = useState("");
+  const rootRef = useRef(null);
+  useEffect(() => {
+    if (!open) return;
+    function onDoc(e) { if (rootRef.current && !rootRef.current.contains(e.target)) onClose(); }
+    document.addEventListener('mousedown', onDoc);
+    return () => document.removeEventListener('mousedown', onDoc);
+  }, [open]);
+
+  if (!currentUser) return null;
+  const userList = Object.values(users);
+
+  return (
+    <div className="user-switcher" ref={rootRef}>
+      <button className="user-chip" onClick={onToggle}>
+        <span className="user-avatar" style={{ background: currentUser.color }}>
+          {currentUser.name.slice(0, 1).toUpperCase()}
+        </span>
+        <span className="user-name">{currentUser.name}</span>
+        <span className="user-caret">▾</span>
+      </button>
+      {open && (
+        <div className="user-menu">
+          <div className="user-menu-head">{tr('travellers')}</div>
+          {userList.map(u => (
+            <div key={u.id} className={`user-row ${u.id === currentUser.id ? 'is-current' : ''}`}>
+              <span className="user-avatar sm" style={{ background: u.color }}>
+                {u.name.slice(0, 1).toUpperCase()}
+              </span>
+              {renaming === u.id ? (
+                <input
+                  className="user-rename"
+                  value={newName}
+                  autoFocus
+                  onChange={(e) => setNewName(e.target.value)}
+                  onBlur={() => {
+                    if (newName.trim()) onRename(u.id, newName.trim());
+                    setRenaming(null);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') e.target.blur();
+                    if (e.key === 'Escape') { setRenaming(null); }
+                  }}
+                />
+              ) : (
+                <span
+                  className="user-row-name"
+                  onClick={() => onSwitch(u.id)}
+                  onDoubleClick={() => { setRenaming(u.id); setNewName(u.name); }}
+                  title={tr('switchTo') + ' ' + u.name}
+                >{u.name}</span>
+              )}
+              {userList.length > 1 && (
+                <button className="user-row-del" onClick={() => {
+                  if (confirm(tr('confirmRemoveUser', u.name))) onRemove(u.id);
+                }} title={tr('removeTraveller')}>×</button>
+              )}
+            </div>
+          ))}
+          <button className="user-add-btn" onClick={() => {
+            const name = prompt(tr('travellerName') + ':', '');
+            if (name && name.trim()) onAdd(name.trim());
+          }}>+ {tr('addTraveller')}</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// === Type filter ===
+function TypeFilter({ tr, types, value, counts, onChange }) {
+  if (!types) return null;
+  return (
+    <div className="type-filter">
+      <div className="type-filter-label">{tr('filterByType')}</div>
+      <div className="type-chips">
+        <button
+          className={`type-chip ${value == null ? 'active' : ''}`}
+          onClick={() => onChange(null)}
+        >
+          {tr('typeAll')} <span className="chip-count">{counts._all || 0}</span>
+        </button>
+        {types.map(vt => {
+          const count = counts[vt.id] || 0;
+          if (count === 0) return null;
+          return (
+            <button
+              key={vt.id}
+              className={`type-chip ${value === vt.id ? 'active' : ''}`}
+              onClick={() => onChange(value === vt.id ? null : vt.id)}
+              style={value === vt.id ? { '--chip-color': vt.color } : {}}
+            >
+              <span className="chip-glyph" style={{ color: vt.color }}>{vt.glyph}</span>
+              {vt._custom ? vt.label : tr(vt.key)}
+              <span className="chip-count">{count}</span>
+            </button>
+          );
+        })}
+        {counts._none > 0 && (
+          <button
+            className={`type-chip ${value === '_none' ? 'active' : ''}`}
+            onClick={() => onChange(value === '_none' ? null : '_none')}
+          >
+            {tr('typeNone')} <span className="chip-count">{counts._none}</span>
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// === City Composer ===
+function CityComposer({ tr, lang, onAdd, existing }) {
+  const [q, setQ] = useState("");
+  const [results, setResults] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [focused, setFocused] = useState(false);
+  const [active, setActive] = useState(0);
+  const reqIdRef = useRef(0);
+
+  useEffect(() => {
+    const query = q.trim();
+    if (query.length < 2) { setResults([]); setLoading(false); return; }
+    setLoading(true);
+    const myId = ++reqIdRef.current;
+    const handle = setTimeout(async () => {
+      try {
+        const r = await searchCities(query, lang);
+        if (myId !== reqIdRef.current) return;
+        setResults(r);
+      } catch (e) {
+        if (myId !== reqIdRef.current) return;
+        setResults([]);
+      } finally {
+        if (myId === reqIdRef.current) setLoading(false);
+      }
+    }, 380);
+    return () => clearTimeout(handle);
+  }, [q, lang]);
+
+  function pickMatch(m) {
+    const aliases = window.COUNTRY_ALIASES || {};
+    const country = aliases[m.country] || m.country;
+    onAdd({ ...m, country });
+    setQ("");
+    setResults([]);
+    setActive(0);
+  }
+  function handleAdd() { if (results.length) pickMatch(results[active]); }
+
+  const showDropdown = focused && q.trim().length >= 2;
+
+  return (
+    <div className="add-row">
+      <input
+        className="add-input"
+        type="text"
+        placeholder={tr('addPlaceholder')}
+        value={q}
+        onFocus={() => setFocused(true)}
+        onBlur={() => setTimeout(() => setFocused(false), 180)}
+        onChange={(e) => { setQ(e.target.value); setActive(0); }}
+        onKeyDown={(e) => {
+          if (e.key === 'ArrowDown') { e.preventDefault(); setActive(i => Math.min(i + 1, results.length - 1)); }
+          else if (e.key === 'ArrowUp') { e.preventDefault(); setActive(i => Math.max(i - 1, 0)); }
+          else if (e.key === 'Enter') { e.preventDefault(); handleAdd(); }
+        }}
+      />
+      <button className="add-btn" onClick={handleAdd} disabled={!results.length}>{tr('addBtn')}</button>
+      {showDropdown && (
+        <div className="suggest">
+          {loading && <div className="suggest-empty">{tr('searching')}</div>}
+          {!loading && results.length === 0 && (
+            <div className="suggest-empty">{tr('noMatches')}</div>
+          )}
+          {!loading && results.map((m, i) => {
+            const dup = Object.values(existing).some(c => c.name === m.name && c.country === (window.COUNTRY_ALIASES?.[m.country] || m.country));
+            return (
+              <div key={i}
+                  className={`suggest-item ${i === active ? 'active' : ''} ${dup ? 'is-dup' : ''}`}
+                  onMouseDown={() => !dup && pickMatch(m)}>
+                <span>{m.name}{dup ? ' ✓' : ''}</span>
+                <span className="suggest-country">{m.country}</span>
+              </div>
+            );
+          })}
+          {!loading && results.length > 0 && (
+            <div className="suggest-hint">{tr('apiHint')}</div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// === Country list ===
+function CountryList({ tr, data, allCities, users, currentUserId, filter, types, selectedCity, onSelectCity, onToggleVisited, onRemoveCity, collapseVisited }) {
+  const [collapsed, setCollapsed] = useState({});
+  const typeById = useMemo(() => Object.fromEntries((types || []).map(t => [t.id, t])), [types]);
+
+  const countries = useMemo(() => {
+    return Object.entries(data.countries)
+      .map(([name, c]) => ({ name, ...c, ratio: countryVisitedRatio(name, data) }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }, [data]);
+
+  if (countries.length === 0) {
+    return (
+      <div className="empty-state">
+        <div className="hint">{tr('emptyHeadline')}</div>
+        <div className="sub">{tr('emptySub')}</div>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      {countries.map(country => {
+        const cities = country.cities.map(n => data.cities[n]).filter(Boolean);
+        let filtered = cities;
+        if (filter === 'plan') filtered = cities.filter(c => !c.visited);
+        else if (filter === 'visited') filtered = cities.filter(c => c.visited);
+        if (filter !== 'all' && filtered.length === 0) return null;
+
+        const isCollapsed = collapsed[country.name] ?? (collapseVisited && country.ratio === 1);
+        const pct = country.ratio == null ? 0 : Math.round(country.ratio * 100);
+
+        return (
+          <div key={country.name} className="country-group">
+            <div className="country-head" onClick={() => setCollapsed(s => ({ ...s, [country.name]: !isCollapsed }))}>
+              <span className="country-flag-disc" style={{ background: countryColor(country.ratio) }}></span>
+              <span className="country-name">{country.name}</span>
+              <span className="country-pct">{pct}%</span>
+            </div>
+            <div className="country-bar">
+              <div className="country-bar-fill" style={{ width: pct + '%', background: countryColor(country.ratio) }}></div>
+            </div>
+            {!isCollapsed && (
+              <ul className="city-list">
+                {filtered.map(city => {
+                  const vt = city.type && typeById[city.type];
+                  const others = (city.participants || []).filter(id => id !== currentUserId);
+                  return (
+                    <li
+                      key={city.name}
+                      className={`city-item ${selectedCity === city.name ? 'selected' : ''}`}
+                      onClick={() => onSelectCity(city.name)}
+                    >
+                      <span
+                        className={`city-check ${city.visited ? 'checked' : ''}`}
+                        onClick={(e) => { e.stopPropagation(); onToggleVisited(city.name); }}
+                      ></span>
+                      <span className={`city-label ${city.visited ? 'visited' : ''}`}>{city.name}</span>
+                      {vt && (
+                        <span className="city-type-glyph" style={{ color: vt.color }} title={vt._custom ? vt.label : tr(vt.key)}>{vt.glyph}</span>
+                      )}
+                      {others.length > 0 && (
+                        <span className="city-shared" title={tr('sharedWith', others.length)}>
+                          {others.slice(0, 3).map(id => {
+                            const u = users[id]; if (!u) return null;
+                            return <span key={id} className="shared-dot" style={{ background: u.color }} title={u.name}></span>;
+                          })}
+                          {others.length > 3 && <span className="shared-more">+{others.length - 3}</span>}
+                        </span>
+                      )}
+                      {city.photos && city.photos.length > 0 && (
+                        <span className="city-photo-count">{city.photos.length} ph</span>
+                      )}
+                      <span className="city-del" onClick={(e) => {
+                        e.stopPropagation();
+                        if (confirm(tr('confirmRemoveShort', city.name))) onRemoveCity(city.name);
+                      }}>×</span>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// === Participants picker ===
+function ParticipantsPicker({ tr, city, users, currentUserId, onToggle }) {
+  const userList = Object.values(users);
+  const participants = city.participants || [];
+  return (
+    <div className="participants">
+      {userList.map(u => {
+        const active = participants.includes(u.id);
+        const self = u.id === currentUserId;
+        return (
+          <button
+            key={u.id}
+            className={`participant ${active ? 'active' : ''} ${self ? 'is-self' : ''}`}
+            onClick={() => onToggle(u.id)}
+            title={(active ? tr('removeFromTrip') : tr('addParticipant')) + ' — ' + u.name}
+          >
+            <span className="participant-avatar" style={{ background: u.color }}>
+              {u.name.slice(0, 1).toUpperCase()}
+            </span>
+            <span className="participant-name">{u.name}{self ? ' (you)' : ''}</span>
+            <span className="participant-check">{active ? '✓' : '+'}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+// === Custom type manager (in Tweaks) ===
+// Supports adding, removing, and editing the label (slug) of custom types.
+function CustomTypeManager({ tr, customTypes, onAdd, onRemove, onUpdate }) {
+  const [creating, setCreating] = useState(false);
+  const [label, setLabel] = useState("");
+  const [color, setColor] = useState(CUSTOM_TYPE_COLORS[0]);
+  const [glyph, setGlyph] = useState(CUSTOM_TYPE_GLYPHS[0]);
+  const [editingId, setEditingId] = useState(null);
+  const [editLabel, setEditLabel] = useState("");
+
+  function submit() {
+    if (!label.trim()) return;
+    onAdd({ label: label.trim(), color, glyph });
+    setLabel(""); setColor(CUSTOM_TYPE_COLORS[0]); setGlyph(CUSTOM_TYPE_GLYPHS[0]);
+    setCreating(false);
+  }
+
+  function submitEdit(id) {
+    if (editLabel.trim()) onUpdate(id, { label: editLabel.trim() });
+    setEditingId(null);
+  }
+
+  return (
+    <div className="ctype-manager">
+      {(customTypes || []).map(t => (
+        <div key={t.id} className="ctype-row">
+          <span className="ctype-glyph" style={{ color: t.color, borderColor: t.color }}>{t.glyph}</span>
+          {editingId === t.id ? (
+            <input
+              className="ctype-input ctype-edit-input"
+              value={editLabel}
+              autoFocus
+              onChange={(e) => setEditLabel(e.target.value)}
+              onBlur={() => submitEdit(t.id)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') { e.target.blur(); }
+                if (e.key === 'Escape') setEditingId(null);
+              }}
+            />
+          ) : (
+            <span className="ctype-label">{t.label}</span>
+          )}
+          <button
+            className="ctype-edit-btn"
+            onClick={() => { setEditingId(t.id); setEditLabel(t.label); }}
+            title={tr('editType')}
+          >✎</button>
+          <button className="ctype-del" onClick={() => {
+            if (confirm(tr('confirmDeleteType', t.label))) onRemove(t.id);
+          }} title={tr('deleteType')}>×</button>
+        </div>
+      ))}
+
+      {!creating && (
+        <button className="ctype-add-btn" onClick={() => setCreating(true)}>+ {tr('newType')}</button>
+      )}
+      {creating && (
+        <div className="ctype-form">
+          <input
+            className="ctype-input"
+            placeholder={tr('typeLabelPh')}
+            value={label}
+            onChange={(e) => setLabel(e.target.value)}
+            autoFocus
+            onKeyDown={(e) => { if (e.key === 'Enter') submit(); if (e.key === 'Escape') setCreating(false); }}
+          />
+          <div className="ctype-pick-row">
+            <div className="ctype-pick-label">{tr('color')}</div>
+            <div className="ctype-swatches">
+              {CUSTOM_TYPE_COLORS.map(c => (
+                <button key={c}
+                  className={`ctype-swatch ${color === c ? 'active' : ''}`}
+                  style={{ background: c }}
+                  onClick={() => setColor(c)} />
+              ))}
+            </div>
+          </div>
+          <div className="ctype-pick-row">
+            <div className="ctype-pick-label">{tr('glyph')}</div>
+            <div className="ctype-glyphs">
+              {CUSTOM_TYPE_GLYPHS.map(g => (
+                <button key={g}
+                  className={`ctype-gpick ${glyph === g ? 'active' : ''}`}
+                  style={glyph === g ? { color, borderColor: color } : {}}
+                  onClick={() => setGlyph(g)}>{g}</button>
+              ))}
+            </div>
+          </div>
+          <div className="ctype-form-actions">
+            <button className="ctype-cancel" onClick={() => setCreating(false)}>{tr('cancel')}</button>
+            <button className="ctype-submit" onClick={submit} disabled={!label.trim()}>{tr('create')}</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// === Detail panel ===
+function DetailPanel({ tr, city, users, currentUserId, types, customTypes, onClose, onToggleVisited, onUpdate, onAddPhoto, onRemovePhoto, onRemove, onOpenPhoto, onToggleParticipant, onAddCustomType }) {
+  const fileRef = useRef(null);
+  const [showInlineType, setShowInlineType] = useState(false);
+  const [inlineLabel, setInlineLabel] = useState("");
+  const [inlineColor, setInlineColor] = useState(CUSTOM_TYPE_COLORS[0]);
+  const [inlineGlyph, setInlineGlyph] = useState(CUSTOM_TYPE_GLYPHS[0]);
+
+  function handleFiles(files) {
+    Array.from(files).forEach(file => {
+      if (!file.type.startsWith('image/')) return;
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const img = new Image();
+        img.onload = () => {
+          const max = 1200;
+          let w = img.width, h = img.height;
+          if (w > max || h > max) {
+            const r = Math.min(max / w, max / h);
+            w = Math.round(w * r); h = Math.round(h * r);
+          }
+          const cv = document.createElement('canvas');
+          cv.width = w; cv.height = h;
+          cv.getContext('2d').drawImage(img, 0, 0, w, h);
+          onAddPhoto(cv.toDataURL('image/jpeg', 0.82));
+        };
+        img.src = e.target.result;
+      };
+      reader.readAsDataURL(file);
+    });
+  }
+
+  function submitInline() {
+    if (!inlineLabel.trim()) return;
+    onAddCustomType({ label: inlineLabel.trim(), color: inlineColor, glyph: inlineGlyph });
+    setInlineLabel(""); setShowInlineType(false);
+  }
+
+  const lat = city.latitude, lng = city.longitude;
+  const photoCount = (city.photos || []).length;
+
+  return (
+    <div className="detail">
+      <div className="detail-head">
+        <button className="detail-close" onClick={onClose}>×</button>
+        <div className="detail-country">{city.country}</div>
+        <div className="detail-city">{city.name}</div>
+        {lat != null && (
+          <div className="detail-coords">
+            {Math.abs(lat).toFixed(3)}° {lat >= 0 ? 'N' : 'S'} ·&nbsp;
+            {Math.abs(lng).toFixed(3)}° {lng >= 0 ? 'E' : 'W'}
+          </div>
+        )}
+      </div>
+      <div className="detail-body">
+        <div className={`detail-toggle ${city.visited ? 'is-visited' : ''}`} onClick={onToggleVisited}>
+          {city.visited ? tr('detailVisited') : tr('detailWishlist')}
+          <span className="pill">{city.visited ? tr('tapToUndo') : tr('tapToVisit')}</span>
+        </div>
+
+        <div className="field-block">
+          <div className="field-label">{tr('participants')}</div>
+          <ParticipantsPicker
+            tr={tr}
+            city={city}
+            users={users}
+            currentUserId={currentUserId}
+            onToggle={onToggleParticipant}
+          />
+        </div>
+
+        <div className="field-block">
+          <div className="field-label">{tr('vacationType')}</div>
+          <div className="type-picker">
+            <button
+              className={`type-pick ${!city.type ? 'active' : ''}`}
+              onClick={() => onUpdate({ type: "" })}
+            >{tr('typeNone')}</button>
+            {types.map(vt => (
+              <button
+                key={vt.id}
+                className={`type-pick ${city.type === vt.id ? 'active' : ''}`}
+                style={city.type === vt.id ? { borderColor: vt.color, background: `color-mix(in oklch, ${vt.color} 12%, var(--bg-card))` } : {}}
+                onClick={() => onUpdate({ type: vt.id })}
+                title={vt._custom ? tr('custom') : ''}
+              >
+                <span className="type-glyph" style={{ color: vt.color }}>{vt.glyph}</span>
+                {vt._custom ? vt.label : tr(vt.key)}
+                {vt._custom && <span className="type-custom-tag">·</span>}
+              </button>
+            ))}
+            {!showInlineType && (
+              <button className="type-pick type-pick-new" onClick={() => setShowInlineType(true)}>
+                + {tr('newType')}
+              </button>
+            )}
+          </div>
+          {showInlineType && (
+            <div className="inline-type-form">
+              <input
+                className="ctype-input"
+                placeholder={tr('typeLabelPh')}
+                value={inlineLabel}
+                onChange={(e) => setInlineLabel(e.target.value)}
+                autoFocus
+                onKeyDown={(e) => { if (e.key === 'Enter') submitInline(); if (e.key === 'Escape') setShowInlineType(false); }}
+              />
+              <div className="ctype-pick-row compact">
+                <div className="ctype-swatches">
+                  {CUSTOM_TYPE_COLORS.map(c => (
+                    <button key={c} className={`ctype-swatch ${inlineColor === c ? 'active' : ''}`} style={{ background: c }} onClick={() => setInlineColor(c)} />
+                  ))}
+                </div>
+              </div>
+              <div className="ctype-pick-row compact">
+                <div className="ctype-glyphs">
+                  {CUSTOM_TYPE_GLYPHS.map(g => (
+                    <button key={g} className={`ctype-gpick ${inlineGlyph === g ? 'active' : ''}`} style={inlineGlyph === g ? { color: inlineColor, borderColor: inlineColor } : {}} onClick={() => setInlineGlyph(g)}>{g}</button>
+                  ))}
+                </div>
+              </div>
+              <div className="ctype-form-actions">
+                <button className="ctype-cancel" onClick={() => setShowInlineType(false)}>{tr('cancel')}</button>
+                <button className="ctype-submit" onClick={submitInline} disabled={!inlineLabel.trim()}>{tr('create')}</button>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {city.visited && (
+          <div className="field-block">
+            <div className="field-label">{tr('whenVisited')}</div>
+            <input className="field-input" type="month" value={city.visitDate || ""}
+                   onChange={(e) => onUpdate({ visitDate: e.target.value })} />
+          </div>
+        )}
+
+        <div className="field-block">
+          <div className="field-label">{tr('notes')}</div>
+          <textarea className="field-textarea" value={city.notes || ""}
+            placeholder={city.visited ? tr('notesPlaceholderVisited') : tr('notesPlaceholderWanted')}
+            onChange={(e) => onUpdate({ notes: e.target.value })} />
+        </div>
+
+        <div className="field-block">
+          <div className="field-label">{tr('memories')} — {photoCount} {photoCount === 1 ? tr('photo') : tr('photos')}</div>
+          <div className="photo-grid">
+            {(city.photos || []).map(p => (
+              <div key={p.id} className="photo-tile">
+                <img src={p.src} alt="" onClick={() => onOpenPhoto(p.src)} />
+                <button className="photo-del" onClick={() => onRemovePhoto(p.id)}>×</button>
+              </div>
+            ))}
+            <label className="photo-add">
+              <input ref={fileRef} type="file" accept="image/*" multiple style={{ display: 'none' }}
+                onChange={(e) => { handleFiles(e.target.files); e.target.value = ''; }} />
+              <span className="plus">+</span>
+              <span>{tr('addPhoto')}</span>
+            </label>
+          </div>
+        </div>
+
+        <div className="danger-row">
+          <button className="danger-btn" onClick={() => {
+            if (confirm(tr('confirmRemove', city.name))) onRemove();
+          }}>{tr('removeCity')}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
