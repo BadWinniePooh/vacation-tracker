@@ -29,12 +29,48 @@ const CUSTOM_TYPE_GLYPHS = ["✦","◉","✺","❀","♨","☀","♪","☂","⚑
 function uid() { return Math.random().toString(36).slice(2, 9); }
 
 function makeUser(name, color) {
-  return { id: uid(), name, color };
+  return { id: uid(), name, color, _ts: Date.now() };
 }
 
 function isValidState(data) {
   return data && data.v === 4 && data.currentUser && data.users &&
     typeof data.cities === 'object' && typeof data.countries === 'object';
+}
+
+function mergeRoots(base, incoming) {
+  if (!base) return incoming;
+  if (!incoming) return base;
+
+  const users = { ...base.users };
+  for (const [id, u] of Object.entries(incoming.users || {})) {
+    if (!users[id] || (u._ts || 0) >= (users[id]._ts || 0)) users[id] = u;
+  }
+
+  const cities = { ...base.cities };
+  for (const [k, c] of Object.entries(incoming.cities || {})) {
+    if (!cities[k] || (c._ts || 0) >= (cities[k]._ts || 0)) cities[k] = c;
+  }
+
+  const ctById = {};
+  for (const t of [...(base.customTypes || []), ...(incoming.customTypes || [])]) {
+    if (!ctById[t.id] || (t._ts || 0) >= (ctById[t.id]._ts || 0)) ctById[t.id] = t;
+  }
+
+  const countries = {};
+  for (const c of Object.values(cities)) {
+    if (!countries[c.country]) countries[c.country] = { cities: [] };
+    if (!countries[c.country].cities.includes(c.name)) countries[c.country].cities.push(c.name);
+  }
+
+  return {
+    ...incoming,
+    users,
+    cities,
+    countries,
+    customTypes: Object.values(ctById),
+    currentUser: base.currentUser,
+    settings: base.settings,
+  };
 }
 
 // Fallback: read from localStorage (migration path from prototype)
@@ -275,7 +311,7 @@ function App() {
     setRoot(prev => prev ? { ...prev, settings: t } : prev);
   }, [t]);
 
-  // Real-time sync: apply state pushed by other devices
+  // Real-time sync: merge state pushed by other devices into local state
   useEffect(() => {
     const es = new EventSource('/api/events');
     es.onmessage = (e) => {
@@ -284,7 +320,7 @@ function App() {
       if (payload.clientId === clientIdRef.current) return;
       fetch('/api/state')
         .then(r => r.ok ? r.json() : null)
-        .then(d => { if (isValidState(d)) setRoot(d); })
+        .then(d => { if (isValidState(d)) setRoot(prev => mergeRoots(prev, d)); })
         .catch(() => {});
     };
     return () => es.close();
@@ -426,6 +462,7 @@ function App() {
         latitude: rec.latitude, longitude: rec.longitude,
         visited: false, visitDate: "", notes: "", photos: [], type: "",
         participants: [prev.currentUser],
+        _ts: Date.now(),
       };
       const cities = { ...prev.cities, [displayName]: city };
       return { ...prev, cities, countries: rebuildCountries(cities) };
@@ -445,7 +482,7 @@ function App() {
   function updateCity(name, patch) {
     patchRoot(prev => {
       const c = prev.cities[name]; if (!c) return prev;
-      return { ...prev, cities: { ...prev.cities, [name]: { ...c, ...patch } } };
+      return { ...prev, cities: { ...prev.cities, [name]: { ...c, ...patch, _ts: Date.now() } } };
     });
   }
   function toggleVisited(name) {
@@ -483,7 +520,7 @@ function App() {
   function addCustomType(rec) {
     patchRoot(prev => {
       const id = 'custom-' + uid();
-      const ct = { id, label: rec.label, color: rec.color, glyph: rec.glyph };
+      const ct = { id, label: rec.label, color: rec.color, glyph: rec.glyph, _ts: Date.now() };
       return { ...prev, customTypes: [...(prev.customTypes || []), ct] };
     });
   }
