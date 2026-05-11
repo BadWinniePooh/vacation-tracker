@@ -213,7 +213,8 @@ async function searchCities(query, lang) {
     const a = r.address || {};
     const name = a.city || a.town || a.village || a.municipality || a.hamlet ||
       (r.display_name || '').split(',')[0].trim();
-    const country = a.country;
+    const code = (a.country_code || '').toLowerCase();
+    const country = (window.COUNTRY_CODE_TO_ENGLISH && window.COUNTRY_CODE_TO_ENGLISH[code]) || a.country;
     if (!name || !country) continue;
     const id = name + '|' + country;
     if (seen.has(id)) continue;

@@ -46,6 +46,7 @@ const NAME_ALIASES = {
   "Cote d'Ivoire": "Côte d'Ivoire",
   "Cape Verde": "Cabo Verde",
   "Swaziland": "Eswatini",
+  "eSwatini": "Eswatini",
   "Macedonia": "North Macedonia",
   "Republic of Serbia": "Serbia",
   "Republic of the Congo": "Congo",
