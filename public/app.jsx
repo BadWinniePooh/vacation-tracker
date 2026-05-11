@@ -495,6 +495,11 @@ function App() {
             onRemove={removeUser}
             onRename={renameUser}
           />
+          <button
+            className="settings-btn"
+            title="Settings & tweaks"
+            onClick={() => window.postMessage({ type: '__activate_edit_mode' }, '*')}
+          >⚙</button>
         </div>
       </header>
 
