@@ -256,12 +256,9 @@ function App() {
   useEffect(() => { applyPalette(t.palette); }, [t.palette]);
   useEffect(() => { document.documentElement.lang = t.language; }, [t.language]);
 
-  if (!root) {
-    return <div className="app-loading">Loading…</div>;
-  }
-
-  const currentUser = root.users[root.currentUser];
-  const customTypes = root.customTypes || [];
+  // Derive from root (safe to read as null — hooks below guard on currentUser)
+  const currentUser = root ? root.users[root.currentUser] : null;
+  const customTypes = root ? (root.customTypes || []) : [];
   const effectiveTypes = useEffectiveTypes(customTypes);
 
   useEffect(() => {
@@ -274,7 +271,7 @@ function App() {
   const data = useMemo(() => {
     const cities = {};
     const countries = {};
-    if (!currentUser) return { cities, countries };
+    if (!currentUser || !root) return { cities, countries };
     for (const [k, c] of Object.entries(root.cities || {})) {
       if ((c.participants || []).includes(currentUser.id)) {
         cities[k] = c;
@@ -283,7 +280,7 @@ function App() {
       }
     }
     return { cities, countries };
-  }, [root.cities, currentUser?.id]);
+  }, [root?.cities, currentUser?.id]);
 
   const stats = useMemo(() => {
     const cities = Object.values(data.cities);
@@ -292,6 +289,11 @@ function App() {
     const cnv = countries.filter(c => countryVisitedRatio(c, data) === 1).length;
     return { cities: { v: cv, t: cities.length }, countries: { v: cnv, t: countries.length } };
   }, [data]);
+
+  // All hooks above — safe to bail out for loading state now
+  if (!root) {
+    return <div className="app-loading">Loading…</div>;
+  }
 
   // === Root mutators ===
   function patchRoot(fn) { setRoot(prev => fn(prev)); }
