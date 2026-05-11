@@ -3,6 +3,7 @@ const { useState, useEffect, useLayoutEffect, useRef, useMemo, useCallback } = R
 
 // === Persistence keys (localStorage fallback only) ===
 const STORAGE_KEY_V4 = 'atlas-vacation-tracker-v4';
+const CURRENT_USER_KEY = 'atlas-current-user';
 const STORAGE_KEY_V3 = 'atlas-vacation-tracker-v3';
 const STORAGE_KEY_V2 = 'atlas-vacation-tracker-v2';
 const CACHE_KEY = 'atlas-search-cache-v1';
@@ -33,8 +34,14 @@ function makeUser(name, color) {
 }
 
 function isValidState(data) {
-  return data && data.v === 4 && data.currentUser && data.users &&
+  return data && data.v === 4 && data.users && Object.keys(data.users).length > 0 &&
     typeof data.cities === 'object' && typeof data.countries === 'object';
+}
+
+function loadCurrentUser(state) {
+  const stored = localStorage.getItem(CURRENT_USER_KEY);
+  if (stored && state.users[stored]) return stored;
+  return Object.keys(state.users)[0];
 }
 
 function mergeRoots(base, incoming) {
@@ -277,23 +284,36 @@ function App() {
   const settingsAppliedRef = useRef(false);
   const clientIdRef = useRef(Math.random().toString(36).slice(2, 10));
 
-  // Load state from API on mount; fall back to localStorage if server unreachable
+  // Load state from API on mount; fall back to localStorage if server unreachable.
+  // currentUser is device-local: injected from localStorage, never from DB.
   useEffect(() => {
     fetch('/api/state')
       .then(r => r.ok ? r.json() : null)
-      .then(data => setRoot(isValidState(data) ? data : loadLocalOrDefault()))
+      .then(data => {
+        if (isValidState(data)) {
+          setRoot({ ...data, currentUser: loadCurrentUser(data) });
+        } else {
+          setRoot(loadLocalOrDefault());
+        }
+      })
       .catch(() => setRoot(loadLocalOrDefault()));
   }, []);
 
-  // Debounced save to Postgres via API
+  // Persist currentUser to localStorage (device-local, never sent to DB)
+  useEffect(() => {
+    if (root?.currentUser) localStorage.setItem(CURRENT_USER_KEY, root.currentUser);
+  }, [root?.currentUser]);
+
+  // Debounced save to Postgres via API — currentUser excluded, it's device-local
   useEffect(() => {
     if (!root) return;
     clearTimeout(saveTimerRef.current);
     saveTimerRef.current = setTimeout(() => {
+      const { currentUser: _cu, ...toSave } = root;
       fetch('/api/state', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json', 'X-Client-Id': clientIdRef.current },
-        body: JSON.stringify(root),
+        body: JSON.stringify(toSave),
       }).catch(e => console.warn('Save failed:', e));
     }, 800);
   }, [root]);
