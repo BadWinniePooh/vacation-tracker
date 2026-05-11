@@ -32,6 +32,11 @@ function makeUser(name, color) {
   return { id: uid(), name, color };
 }
 
+function isValidState(data) {
+  return data && data.v === 4 && data.currentUser && data.users &&
+    typeof data.cities === 'object' && typeof data.countries === 'object';
+}
+
 // Fallback: read from localStorage (migration path from prototype)
 function loadLocalOrDefault() {
   try {
@@ -236,7 +241,7 @@ function App() {
   useEffect(() => {
     fetch('/api/state')
       .then(r => r.ok ? r.json() : null)
-      .then(data => setRoot(data || loadLocalOrDefault()))
+      .then(data => setRoot(isValidState(data) ? data : loadLocalOrDefault()))
       .catch(() => setRoot(loadLocalOrDefault()));
   }, []);
 
@@ -290,7 +295,24 @@ function App() {
     return { cities: { v: cv, t: cities.length }, countries: { v: cnv, t: countries.length } };
   }, [data]);
 
-  // All hooks above — safe to bail out for loading state now
+  const selected = selectedCity ? data.cities[selectedCity] : null;
+
+  const filteredData = useMemo(() => {
+    if (!typeFilter) return data;
+    const cities = {};
+    for (const [k, c] of Object.entries(data.cities)) {
+      const ct = c.type || "";
+      if (typeFilter === "_none" ? !ct : ct === typeFilter) cities[k] = c;
+    }
+    const countries = {};
+    for (const c of Object.values(cities)) {
+      if (!countries[c.country]) countries[c.country] = { cities: [] };
+      countries[c.country].cities.push(c.name);
+    }
+    return { cities, countries };
+  }, [data, typeFilter]);
+
+  // All hooks above this line — safe to bail out for loading state now
   if (!root) {
     return <div className="app-loading">Loading…</div>;
   }
@@ -441,24 +463,6 @@ function App() {
       customTypes: (prev.customTypes || []).map(t => t.id === id ? { ...t, ...patch } : t),
     }));
   }
-
-  const selected = selectedCity ? data.cities[selectedCity] : null;
-
-  // Filtered cities for map (by type filter)
-  const filteredData = useMemo(() => {
-    if (!typeFilter) return data;
-    const cities = {};
-    for (const [k, c] of Object.entries(data.cities)) {
-      const ct = c.type || "";
-      if (typeFilter === "_none" ? !ct : ct === typeFilter) cities[k] = c;
-    }
-    const countries = {};
-    for (const c of Object.values(cities)) {
-      if (!countries[c.country]) countries[c.country] = { cities: [] };
-      countries[c.country].cities.push(c.name);
-    }
-    return { cities, countries };
-  }, [data, typeFilter]);
 
   return (
     <div className="app">
