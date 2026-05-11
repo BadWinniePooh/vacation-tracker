@@ -1,0 +1,20 @@
+{
+  "id": "/",
+  "name": "Atlas — Vacation Tracker",
+  "short_name": "Atlas",
+  "description": "Track your travels and plan your next adventure",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f8f5ee",
+  "theme_color": "#f8f5ee",
+  "categories": ["travel", "lifestyle"],
+  "icons": [
+    {
+      "src": "/icons/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

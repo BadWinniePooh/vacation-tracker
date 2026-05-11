@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" fill="#f8f5ee"/>
+  <!-- Map pin: teardrop, fits within maskable safe zone (circle r=204 at center) -->
+  <path d="M256 72C170 72 100 142 100 228c0 115 156 212 156 212s156-97 156-212c0-86-70-156-156-156z" fill="#d05030"/>
+  <circle cx="256" cy="220" r="58" fill="#f8f5ee"/>
+</svg>

@@ -4,6 +4,13 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Atlas — Vacation Tracker</title>
+<link rel="manifest" href="/manifest.json" />
+<meta name="theme-color" content="#f8f5ee" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="default" />
+<meta name="apple-mobile-web-app-title" content="Atlas" />
+<link rel="apple-touch-icon" href="/icons/icon.svg" />
 
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -28,5 +35,10 @@
 <script type="text/babel" src="tweaks-panel.jsx"></script>
 <script type="text/babel" src="map.jsx"></script>
 <script type="text/babel" src="app.jsx"></script>
+<script>
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/sw.js');
+  }
+</script>
 </body>
 </html>
