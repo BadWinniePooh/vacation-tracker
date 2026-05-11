@@ -1,5 +1,5 @@
 // Main React app for Atlas vacation tracker.
-const { useState, useEffect, useRef, useMemo, useCallback } = React;
+const { useState, useEffect, useLayoutEffect, useRef, useMemo, useCallback } = React;
 
 // === Persistence keys (localStorage fallback only) ===
 const STORAGE_KEY_V4 = 'atlas-vacation-tracker-v4';
@@ -236,6 +236,7 @@ function App() {
   const [t, setTweak] = window.useTweaks(TWEAK_DEFAULTS);
   const tr = useI18n(t.language);
   const saveTimerRef = useRef(null);
+  const settingsAppliedRef = useRef(false);
 
   // Load state from API on mount; fall back to localStorage if server unreachable
   useEffect(() => {
@@ -258,7 +259,21 @@ function App() {
     }, 800);
   }, [root]);
 
-  useEffect(() => { applyPalette(t.palette); }, [t.palette]);
+  // Apply saved settings from DB on first root load
+  useEffect(() => {
+    if (!root || settingsAppliedRef.current) return;
+    settingsAppliedRef.current = true;
+    if (root.settings) setTweak(root.settings);
+  }, [root]);
+
+  // Keep settings in root so they're included in DB saves
+  useEffect(() => {
+    if (!root) return;
+    setRoot(prev => prev ? { ...prev, settings: t } : prev);
+  }, [t]);
+
+  // useLayoutEffect so CSS vars are set before child effects (repaintCountries) read them
+  useLayoutEffect(() => { applyPalette(t.palette); }, [t.palette]);
   useEffect(() => { document.documentElement.lang = t.language; }, [t.language]);
 
   // Derive from root (safe to read as null — hooks below guard on currentUser)
