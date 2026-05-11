@@ -63,7 +63,8 @@ input, textarea, select { font-family: inherit; color: inherit; }
   padding: 0 24px;
   border-bottom: 1px solid var(--line);
   background: var(--bg-card);
-  z-index: 10;
+  position: relative;
+  z-index: 1100;
 }
 .brand {
   display: flex;
