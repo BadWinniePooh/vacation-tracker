@@ -58,7 +58,11 @@ app.use(helmet({
       fontSrc: ["'self'", 'fonts.gstatic.com'],
       // OpenStreetMap tiles + base64-encoded photos stored in state
       imgSrc: ["'self'", 'tile.openstreetmap.org', 'data:', 'blob:'],
-      connectSrc: ["'self'"],
+      connectSrc: [
+        "'self'",
+        'cdn.jsdelivr.net',             // world-atlas GeoJSON for the map
+        'nominatim.openstreetmap.org',  // city geocoding / search
+      ],
       workerSrc: ["'self'"],
       manifestSrc: ["'self'"],
       frameSrc: ["'none'"],
