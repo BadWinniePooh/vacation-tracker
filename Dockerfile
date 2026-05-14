@@ -1,4 +1,7 @@
 FROM node:22-alpine
+# Upgrade all Alpine packages to their latest patched versions to eliminate
+# known OS-level CVEs that have available fixes (keeps trivy --ignore-unfixed clean).
+RUN apk upgrade --no-cache
 WORKDIR /app
 COPY package*.json ./
 RUN npm ci --production
