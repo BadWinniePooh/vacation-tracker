@@ -41,18 +41,32 @@ jobs:
           fi
           echo "OK: container runs as non-root (UID $USER_ID)"
 
-      - name: Scan image with Trivy (CRITICAL + HIGH CVEs)
+      # Table format: human-readable CVE list visible in the job log.
+      # This step gates the build — it fails on CRITICAL/HIGH fixable CVEs.
+      - name: Scan image with Trivy — table output (build gate)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: vacation-tracker:ci
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: true
+
+      # SARIF format: machine-readable report uploaded to the GitHub Security tab.
+      # Runs even when the table step above fails so the report is always available.
+      - name: Scan image with Trivy — SARIF output (Security tab)
+        if: always()
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: vacation-tracker:ci
           format: sarif
           output: trivy-results.sarif
           severity: CRITICAL,HIGH
-          exit-code: "1"       # fail the build on CRITICAL/HIGH findings
-          ignore-unfixed: true # only report issues that have a fix available
+          exit-code: "0"         # do not double-fail; gating is done above
+          ignore-unfixed: true
 
       - name: Upload Trivy SARIF to GitHub Security tab
-        if: always()           # upload even when trivy exits non-zero
+        if: always()
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: trivy-results.sarif
