@@ -1,4 +1,6 @@
 const express = require('express');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 const { Pool } = require('pg');
 const path = require('path');
 
@@ -27,18 +29,82 @@ function mergeStates(base, incoming) {
   return { ...incoming, users, cities, countries, customTypes: Object.values(ctById) };
 }
 
+// Basic structural validation — reject payloads that are clearly not app state
+function isValidStateBody(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return false;
+  if (body.v !== 4) return false;
+  if (typeof body.cities !== 'object' || Array.isArray(body.cities)) return false;
+  if (typeof body.users !== 'object' || Array.isArray(body.users)) return false;
+  return true;
+}
+
+// Restrict to alphanumeric + hyphens, max 64 chars
+function sanitiseClientId(raw) {
+  if (typeof raw !== 'string') return '';
+  return raw.replace(/[^a-zA-Z0-9\-]/g, '').slice(0, 64);
+}
+
 const app = express();
-app.use(express.json({ limit: '50mb' }));
+
+// --- Security headers (OWASP A05) ---
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      // Babel Standalone requires unsafe-eval for in-browser JSX compilation.
+      // To remove this directive, pre-compile the JSX files with a build tool.
+      scriptSrc: ["'self'", 'unpkg.com', "'unsafe-eval'"],
+      styleSrc: ["'self'", 'unpkg.com', 'fonts.googleapis.com', "'unsafe-inline'"],
+      fontSrc: ["'self'", 'fonts.gstatic.com'],
+      // OpenStreetMap tiles + base64-encoded photos stored in state
+      imgSrc: ["'self'", 'tile.openstreetmap.org', 'data:', 'blob:'],
+      connectSrc: ["'self'"],
+      workerSrc: ["'self'"],
+      manifestSrc: ["'self'"],
+      frameSrc: ["'none'"],
+      objectSrc: ["'none'"],
+      baseUri: ["'self'"],
+    },
+  },
+  crossOriginEmbedderPolicy: false, // Leaflet cross-origin tiles need this off
+}));
+
+// --- Rate limiting (OWASP A04) ---
+const apiLimiter = rateLimit({
+  windowMs: 60 * 1000,   // 1 minute
+  max: 60,               // 60 requests per minute per IP
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests' },
+});
+
+const writeLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 20,               // writes are heavier; tighter cap
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests' },
+});
+
+app.use('/api/', apiLimiter);
+
+// 10 MB cap — accommodates reasonable base64-photo payloads without enabling trivial DoS
+app.use(express.json({ limit: '10mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL || 'postgres://atlas:atlas_pass@localhost:5432/vacation_tracker',
+  connectionString: process.env.DATABASE_URL,
 });
 
+// Limit concurrent SSE connections to prevent resource exhaustion
+const MAX_SSE_CLIENTS = 100;
 const clients = new Set();
 setInterval(() => { for (const c of clients) c.write(': keepalive\n\n'); }, 25000);
 
 app.get('/api/events', (req, res) => {
+  if (clients.size >= MAX_SSE_CLIENTS) {
+    return res.status(503).json({ error: 'Too many active connections' });
+  }
   res.set({
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
@@ -70,7 +136,11 @@ app.get('/api/state', async (req, res) => {
   }
 });
 
-app.put('/api/state', async (req, res) => {
+app.put('/api/state', writeLimiter, async (req, res) => {
+  if (!isValidStateBody(req.body)) {
+    return res.status(400).json({ error: 'Invalid state payload' });
+  }
+
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -85,7 +155,7 @@ app.put('/api/state', async (req, res) => {
       [merged]
     );
     await client.query('COMMIT');
-    const clientId = req.headers['x-client-id'] || '';
+    const clientId = sanitiseClientId(req.headers['x-client-id'] || '');
     const msg = `data: ${JSON.stringify({ clientId })}\n\n`;
     for (const c of clients) c.write(msg);
     res.json({ ok: true });

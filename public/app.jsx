@@ -564,7 +564,11 @@ function App() {
     <div className="app" data-sidebar={sidebarOpen ? 'open' : 'closed'}>
       <header className="topbar">
         <div className="brand">
-          <div className="brand-mark" dangerouslySetInnerHTML={{__html: tr('brand').replace('—', '<em>—</em>')}} />
+          <div className="brand-mark">
+            {tr('brand').split('—').flatMap((part, i) =>
+              i > 0 ? [<em key={i}>{'—'}</em>, part] : [part]
+            )}
+          </div>
           <div className="brand-tag">{tr('tag')}</div>
         </div>
 
