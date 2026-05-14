@@ -42,7 +42,7 @@ jobs:
           echo "OK: container runs as non-root (UID $USER_ID)"
 
       - name: Scan image with Trivy (CRITICAL + HIGH CVEs)
-        uses: aquasecurity/trivy-action@0.30.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: vacation-tracker:ci
           format: sarif
