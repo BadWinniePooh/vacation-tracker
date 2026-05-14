@@ -284,20 +284,67 @@ function App() {
   const settingsAppliedRef = useRef(false);
   const clientIdRef = useRef(Math.random().toString(36).slice(2, 10));
 
-  // Load state from API on mount; fall back to localStorage if server unreachable.
-  // currentUser is device-local: injected from localStorage, never from DB.
-  useEffect(() => {
-    fetch('/api/state')
+  const [authStatus, setAuthStatus] = useState('loading');
+  const [showLogin, setShowLogin] = useState(false);
+  const [loginError, setLoginError] = useState('');
+  const [loginLoading, setLoginLoading] = useState(false);
+  const isAuth = authStatus === 'authenticated';
+
+  function refreshState() {
+    return fetch('/api/state')
       .then(r => r.ok ? r.json() : null)
       .then(data => {
         if (isValidState(data)) {
-          setRoot({ ...data, currentUser: loadCurrentUser(data) });
-        } else {
-          setRoot(loadLocalOrDefault());
+          setRoot(prev => ({ ...data, currentUser: (prev && prev.currentUser) || loadCurrentUser(data) }));
         }
       })
-      .catch(() => setRoot(loadLocalOrDefault()));
+      .catch(() => {});
+  }
+
+  // Load auth status and state in parallel on mount.
+  // currentUser is device-local: injected from localStorage, never from DB.
+  useEffect(() => {
+    Promise.all([
+      fetch('/api/auth/status').then(r => r.json()).catch(() => ({ authenticated: false })),
+      fetch('/api/state').then(r => r.ok ? r.json() : null).catch(() => null),
+    ]).then(([authData, stateData]) => {
+      setAuthStatus(authData.authenticated ? 'authenticated' : 'unauthenticated');
+      if (isValidState(stateData)) {
+        setRoot({ ...stateData, currentUser: loadCurrentUser(stateData) });
+      } else {
+        setRoot(loadLocalOrDefault());
+      }
+    });
   }, []);
+
+  async function handleLogin(password) {
+    setLoginLoading(true);
+    setLoginError('');
+    try {
+      const res = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password }),
+      });
+      const d = await res.json();
+      if (res.ok) {
+        setAuthStatus('authenticated');
+        setShowLogin(false);
+        await refreshState();
+      } else {
+        setLoginError(d.error || 'Incorrect password');
+      }
+    } catch (e) {
+      setLoginError('Connection error');
+    }
+    setLoginLoading(false);
+  }
+
+  async function handleLogout() {
+    await fetch('/api/auth/logout', { method: 'POST' }).catch(() => {});
+    setAuthStatus('unauthenticated');
+    await refreshState();
+  }
 
   // Persist currentUser to localStorage (device-local, never sent to DB)
   useEffect(() => {
@@ -583,28 +630,37 @@ function App() {
               <div className="stat-label">{tr('statCountries')}</div>
             </div>
           </div>
-          <UserSwitcher
-            tr={tr}
-            users={root.users}
-            currentUser={currentUser}
-            open={userMenuOpen}
-            onToggle={() => setUserMenuOpen(o => !o)}
-            onClose={() => setUserMenuOpen(false)}
-            onSwitch={switchUser}
-            onAdd={addUser}
-            onRemove={removeUser}
-            onRename={renameUser}
-          />
+          {isAuth ? (
+            <UserSwitcher
+              tr={tr}
+              users={root.users}
+              currentUser={currentUser}
+              open={userMenuOpen}
+              onToggle={() => setUserMenuOpen(o => !o)}
+              onClose={() => setUserMenuOpen(false)}
+              onSwitch={switchUser}
+              onAdd={addUser}
+              onRemove={removeUser}
+              onRename={renameUser}
+            />
+          ) : (
+            <button className="auth-btn" onClick={() => setShowLogin(true)}>Sign in</button>
+          )}
           <button
             className={`mob-sidebar-btn${sidebarOpen ? ' is-open' : ''}`}
             aria-label="Toggle city list"
             onClick={() => setSidebarOpen(o => !o)}
           >{sidebarOpen ? '✕' : '☰'}</button>
-          <button
-            className="settings-btn"
-            title="Settings & tweaks"
-            onClick={() => window.postMessage({ type: '__activate_edit_mode' }, '*')}
-          >⚙</button>
+          {isAuth && (
+            <button
+              className="settings-btn"
+              title="Settings & tweaks"
+              onClick={() => window.postMessage({ type: '__activate_edit_mode' }, '*')}
+            >⚙</button>
+          )}
+          {isAuth && (
+            <button className="auth-btn auth-btn-out" title="Sign out" onClick={handleLogout}>⏻</button>
+          )}
         </div>
       </header>
 
@@ -655,6 +711,7 @@ function App() {
             currentUserId={root.currentUser}
             types={effectiveTypes}
             customTypes={customTypes}
+            isAuth={isAuth}
             onClose={() => setSelectedCity(null)}
             onToggleVisited={() => toggleVisited(selected.name)}
             onUpdate={(patch) => updateCity(selected.name, patch)}
@@ -675,7 +732,7 @@ function App() {
           <button className={`side-tab ${tab === 'all' ? 'active' : ''}`} onClick={() => setTab('all')}>{tr('tabAll')}</button>
         </div>
         <div className="side-body">
-          <CityComposer tr={tr} lang={t.language} onAdd={addCity} existing={data.cities} />
+          {isAuth && <CityComposer tr={tr} lang={t.language} onAdd={addCity} existing={data.cities} />}
           <TypeFilter
             tr={tr}
             types={effectiveTypes}
@@ -696,6 +753,7 @@ function App() {
             onToggleVisited={toggleVisited}
             onRemoveCity={removeCityFromCurrent}
             collapseVisited={t.collapseVisited}
+            isAuth={isAuth}
           />
         </div>
       </aside>
@@ -753,6 +811,15 @@ function App() {
 
       {sidebarOpen && (
         <div className="sidebar-backdrop" onClick={() => setSidebarOpen(false)} />
+      )}
+
+      {showLogin && (
+        <LoginModal
+          onClose={() => { setShowLogin(false); setLoginError(''); }}
+          onLogin={handleLogin}
+          error={loginError}
+          loading={loginLoading}
+        />
       )}
     </div>
   );
@@ -967,7 +1034,7 @@ function CityComposer({ tr, lang, onAdd, existing }) {
 }
 
 // === Country list ===
-function CountryList({ tr, data, allCities, users, currentUserId, filter, types, selectedCity, onSelectCity, onToggleVisited, onRemoveCity, collapseVisited }) {
+function CountryList({ tr, data, allCities, users, currentUserId, filter, types, selectedCity, onSelectCity, onToggleVisited, onRemoveCity, collapseVisited, isAuth }) {
   const [collapsed, setCollapsed] = useState({});
   const typeById = useMemo(() => Object.fromEntries((types || []).map(t => [t.id, t])), [types]);
 
@@ -1020,14 +1087,14 @@ function CountryList({ tr, data, allCities, users, currentUserId, filter, types,
                       onClick={() => onSelectCity(city.name)}
                     >
                       <span
-                        className={`city-check ${city.visited ? 'checked' : ''}`}
-                        onClick={(e) => { e.stopPropagation(); onToggleVisited(city.name); }}
+                        className={`city-check ${city.visited ? 'checked' : ''}${!isAuth ? ' readonly' : ''}`}
+                        onClick={isAuth ? (e) => { e.stopPropagation(); onToggleVisited(city.name); } : (e) => e.stopPropagation()}
                       ></span>
                       <span className={`city-label ${city.visited ? 'visited' : ''}`}>{city.name}</span>
-                      {vt && (
+                      {isAuth && vt && (
                         <span className="city-type-glyph" style={{ color: vt.color }} title={vt._custom ? vt.label : tr(vt.key)}>{vt.glyph}</span>
                       )}
-                      {others.length > 0 && (
+                      {isAuth && others.length > 0 && (
                         <span className="city-shared" title={tr('sharedWith', others.length)}>
                           {others.slice(0, 3).map(id => {
                             const u = users[id]; if (!u) return null;
@@ -1039,10 +1106,10 @@ function CountryList({ tr, data, allCities, users, currentUserId, filter, types,
                       {city.photos && city.photos.length > 0 && (
                         <span className="city-photo-count">{city.photos.length} ph</span>
                       )}
-                      <span className="city-del" onClick={(e) => {
+                      {isAuth && <span className="city-del" onClick={(e) => {
                         e.stopPropagation();
                         if (confirm(tr('confirmRemoveShort', city.name))) onRemoveCity(city.name);
-                      }}>×</span>
+                      }}>×</span>}
                     </li>
                   );
                 })}
@@ -1182,7 +1249,7 @@ function CustomTypeManager({ tr, customTypes, onAdd, onRemove, onUpdate }) {
 }
 
 // === Detail panel ===
-function DetailPanel({ tr, city, users, currentUserId, types, customTypes, onClose, onToggleVisited, onUpdate, onAddPhoto, onRemovePhoto, onRemove, onOpenPhoto, onToggleParticipant, onAddCustomType }) {
+function DetailPanel({ tr, city, users, currentUserId, types, customTypes, isAuth, onClose, onToggleVisited, onUpdate, onAddPhoto, onRemovePhoto, onRemove, onOpenPhoto, onToggleParticipant, onAddCustomType }) {
   const fileRef = useRef(null);
   const [showInlineType, setShowInlineType] = useState(false);
   const [inlineLabel, setInlineLabel] = useState("");
@@ -1236,23 +1303,28 @@ function DetailPanel({ tr, city, users, currentUserId, types, customTypes, onClo
         )}
       </div>
       <div className="detail-body">
-        <div className={`detail-toggle ${city.visited ? 'is-visited' : ''}`} onClick={onToggleVisited}>
+        <div
+          className={`detail-toggle ${city.visited ? 'is-visited' : ''}${!isAuth ? ' readonly' : ''}`}
+          onClick={isAuth ? onToggleVisited : undefined}
+        >
           {city.visited ? tr('detailVisited') : tr('detailWishlist')}
-          <span className="pill">{city.visited ? tr('tapToUndo') : tr('tapToVisit')}</span>
+          {isAuth && <span className="pill">{city.visited ? tr('tapToUndo') : tr('tapToVisit')}</span>}
         </div>
 
-        <div className="field-block">
-          <div className="field-label">{tr('participants')}</div>
-          <ParticipantsPicker
-            tr={tr}
-            city={city}
-            users={users}
-            currentUserId={currentUserId}
-            onToggle={onToggleParticipant}
-          />
-        </div>
+        {isAuth && (
+          <div className="field-block">
+            <div className="field-label">{tr('participants')}</div>
+            <ParticipantsPicker
+              tr={tr}
+              city={city}
+              users={users}
+              currentUserId={currentUserId}
+              onToggle={onToggleParticipant}
+            />
+          </div>
+        )}
 
-        <div className="field-block">
+        {isAuth && <div className="field-block">
           <div className="field-label">{tr('vacationType')}</div>
           <div className="type-picker">
             <button
@@ -1308,45 +1380,88 @@ function DetailPanel({ tr, city, users, currentUserId, types, customTypes, onClo
               </div>
             </div>
           )}
-        </div>
+        </div>}
 
         {city.visited && (
           <div className="field-block">
             <div className="field-label">{tr('whenVisited')}</div>
-            <input className="field-input" type="month" value={city.visitDate || ""}
-                   onChange={(e) => onUpdate({ visitDate: e.target.value })} />
+            {isAuth
+              ? <input className="field-input" type="month" value={city.visitDate || ""}
+                       onChange={(e) => onUpdate({ visitDate: e.target.value })} />
+              : <div className="field-input-ro">{city.visitDate || '—'}</div>
+            }
           </div>
         )}
 
         <div className="field-block">
           <div className="field-label">{tr('notes')}</div>
-          <textarea className="field-textarea" value={city.notes || ""}
-            placeholder={city.visited ? tr('notesPlaceholderVisited') : tr('notesPlaceholderWanted')}
-            onChange={(e) => onUpdate({ notes: e.target.value })} />
+          {isAuth
+            ? <textarea className="field-textarea" value={city.notes || ""}
+                placeholder={city.visited ? tr('notesPlaceholderVisited') : tr('notesPlaceholderWanted')}
+                onChange={(e) => onUpdate({ notes: e.target.value })} />
+            : <div className="field-textarea-ro">{city.notes || <span className="field-empty">—</span>}</div>
+          }
         </div>
 
-        <div className="field-block">
-          <div className="field-label">{tr('memories')} — {photoCount} {photoCount === 1 ? tr('photo') : tr('photos')}</div>
-          <div className="photo-grid">
-            {(city.photos || []).map(p => (
-              <div key={p.id} className="photo-tile">
-                <img src={p.src} alt="" onClick={() => onOpenPhoto(p.src)} />
-                <button className="photo-del" onClick={() => onRemovePhoto(p.id)}>×</button>
-              </div>
-            ))}
-            <label className="photo-add">
-              <input ref={fileRef} type="file" accept="image/*" multiple style={{ display: 'none' }}
-                onChange={(e) => { handleFiles(e.target.files); e.target.value = ''; }} />
-              <span className="plus">+</span>
-              <span>{tr('addPhoto')}</span>
-            </label>
+        {(isAuth || photoCount > 0) && (
+          <div className="field-block">
+            <div className="field-label">{tr('memories')} — {photoCount} {photoCount === 1 ? tr('photo') : tr('photos')}</div>
+            <div className="photo-grid">
+              {(city.photos || []).map(p => (
+                <div key={p.id} className="photo-tile">
+                  <img src={p.src} alt="" onClick={() => onOpenPhoto(p.src)} />
+                  {isAuth && <button className="photo-del" onClick={() => onRemovePhoto(p.id)}>×</button>}
+                </div>
+              ))}
+              {isAuth && (
+                <label className="photo-add">
+                  <input ref={fileRef} type="file" accept="image/*" multiple style={{ display: 'none' }}
+                    onChange={(e) => { handleFiles(e.target.files); e.target.value = ''; }} />
+                  <span className="plus">+</span>
+                  <span>{tr('addPhoto')}</span>
+                </label>
+              )}
+            </div>
           </div>
-        </div>
+        )}
 
-        <div className="danger-row">
-          <button className="danger-btn" onClick={() => {
-            if (confirm(tr('confirmRemove', city.name))) onRemove();
-          }}>{tr('removeCity')}</button>
+        {isAuth && (
+          <div className="danger-row">
+            <button className="danger-btn" onClick={() => {
+              if (confirm(tr('confirmRemove', city.name))) onRemove();
+            }}>{tr('removeCity')}</button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// === Login modal ===
+function LoginModal({ onClose, onLogin, error, loading }) {
+  const [pw, setPw] = useState('');
+  function submit() { if (pw.trim()) onLogin(pw); }
+  return (
+    <div className="login-overlay" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+      <div className="login-modal">
+        <button className="login-close" onClick={onClose}>×</button>
+        <div className="login-title">Sign in to edit</div>
+        <div className="login-sub">Enter the access password to add or change places.</div>
+        <input
+          className="login-input"
+          type="password"
+          placeholder="Password"
+          value={pw}
+          autoFocus
+          onChange={e => setPw(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Enter') submit(); if (e.key === 'Escape') onClose(); }}
+        />
+        {error && <div className="login-error">{error}</div>}
+        <div className="login-actions">
+          <button className="login-btn" onClick={submit} disabled={loading || !pw.trim()}>
+            {loading ? 'Signing in…' : 'Sign in'}
+          </button>
+          <button className="login-guest" onClick={onClose}>Continue as guest</button>
         </div>
       </div>
     </div>

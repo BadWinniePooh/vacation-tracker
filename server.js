@@ -1,6 +1,9 @@
 const express = require('express');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
+const session = require('express-session');
+const pgSession = require('connect-pg-simple')(session);
+const bcrypt = require('bcryptjs');
 const { Pool } = require('pg');
 const path = require('path');
 
@@ -27,6 +30,18 @@ function mergeStates(base, incoming) {
   }
 
   return { ...incoming, users, cities, countries, customTypes: Object.values(ctById) };
+}
+
+// Strip type and participants from every city so guests can't see them
+function redactForGuest(state) {
+  if (!state) return state;
+  const cities = {};
+  for (const [k, c] of Object.entries(state.cities || {})) {
+    // eslint-disable-next-line no-unused-vars
+    const { type: _t, participants: _p, ...pub } = c;
+    cities[k] = pub;
+  }
+  return { ...state, cities };
 }
 
 // Basic structural validation — reject payloads that are clearly not app state
@@ -75,8 +90,8 @@ app.use(helmet({
 
 // --- Rate limiting (OWASP A04) ---
 const apiLimiter = rateLimit({
-  windowMs: 60 * 1000,   // 1 minute
-  max: 60,               // 60 requests per minute per IP
+  windowMs: 60 * 1000,
+  max: 60,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many requests' },
@@ -84,23 +99,57 @@ const apiLimiter = rateLimit({
 
 const writeLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 20,               // writes are heavier; tighter cap
+  max: 20,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many requests' },
+});
+
+// Tighter limit on login to slow brute-force (OWASP A07)
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many login attempts' },
 });
 
 app.use('/api/', apiLimiter);
 
 // 10 MB cap — accommodates reasonable base64-photo payloads without enabling trivial DoS
 app.use(express.json({ limit: '10mb' }));
-app.use(express.static(path.join(__dirname, 'public')));
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
 });
 
-// Limit concurrent SSE connections to prevent resource exhaustion
+// --- Session middleware ---
+app.use(session({
+  store: new pgSession({
+    pool,
+    tableName: 'user_sessions',
+    createTableIfMissing: true,
+  }),
+  secret: process.env.SESSION_SECRET,
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'lax',
+    maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days
+  },
+}));
+
+app.use(express.static(path.join(__dirname, 'public')));
+
+// --- Auth middleware ---
+function requireAuth(req, res, next) {
+  if (req.session && req.session.authenticated) return next();
+  res.status(401).json({ error: 'Authentication required' });
+}
+
+// --- SSE clients ---
 const MAX_SSE_CLIENTS = 100;
 const clients = new Set();
 setInterval(() => { for (const c of clients) c.write(': keepalive\n\n'); }, 25000);
@@ -120,6 +169,39 @@ app.get('/api/events', (req, res) => {
   req.on('close', () => clients.delete(res));
 });
 
+// --- Auth endpoints ---
+app.get('/api/auth/status', (req, res) => {
+  res.json({ authenticated: !!(req.session && req.session.authenticated) });
+});
+
+app.post('/api/auth/login', authLimiter, async (req, res) => {
+  const { password } = req.body || {};
+  if (!password || typeof password !== 'string') {
+    return res.status(400).json({ error: 'Password required' });
+  }
+  const hash = process.env.APP_PASSWORD_HASH;
+  if (!hash) {
+    return res.status(503).json({ error: 'Authentication not configured on this server' });
+  }
+  const ok = await bcrypt.compare(password, hash);
+  if (!ok) {
+    return res.status(401).json({ error: 'Incorrect password' });
+  }
+  req.session.authenticated = true;
+  req.session.save(err => {
+    if (err) return res.status(500).json({ error: 'Session error' });
+    res.json({ ok: true });
+  });
+});
+
+app.post('/api/auth/logout', (req, res) => {
+  req.session.destroy(() => {
+    res.clearCookie('connect.sid');
+    res.json({ ok: true });
+  });
+});
+
+// --- App state ---
 async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS app_state (
@@ -133,14 +215,16 @@ async function initDB() {
 app.get('/api/state', async (req, res) => {
   try {
     const result = await pool.query("SELECT data FROM app_state WHERE id = 'default'");
-    res.json(result.rows.length > 0 ? result.rows[0].data : null);
+    const state = result.rows.length > 0 ? result.rows[0].data : null;
+    const isAuth = !!(req.session && req.session.authenticated);
+    res.json(isAuth ? state : redactForGuest(state));
   } catch (e) {
     console.error('GET /api/state:', e.message);
     res.status(500).json({ error: 'Database error' });
   }
 });
 
-app.put('/api/state', writeLimiter, async (req, res) => {
+app.put('/api/state', requireAuth, writeLimiter, async (req, res) => {
   if (!isValidStateBody(req.body)) {
     return res.status(400).json({ error: 'Invalid state payload' });
   }
