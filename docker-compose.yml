@@ -18,7 +18,9 @@ services:
   app:
     build: .
     ports:
-      - "127.0.0.1:3000:3000"
+      # Set APP_PORT in .env to use a different port (default: 3000).
+      # Binds to all interfaces so the app is reachable on the local network.
+      - "${APP_PORT:-3000}:3000"
     environment:
       DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
       PORT: 3000
