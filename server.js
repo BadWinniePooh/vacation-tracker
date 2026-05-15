@@ -95,6 +95,12 @@ app.use(helmet({
       frameSrc: ["'none'"],
       objectSrc: ["'none'"],
       baseUri: ["'self'"],
+      // Helmet enables upgrade-insecure-requests by default, which tells the
+      // browser to promote every http:// subresource to https://. On a plain
+      // HTTP private deployment this breaks all local file loads. Traefik
+      // already enforces HTTPS at the network level for public deployments, so
+      // the app does not need to repeat the instruction.
+      upgradeInsecureRequests: null,
     },
   },
   crossOriginEmbedderPolicy: false, // Leaflet cross-origin tiles need this off
