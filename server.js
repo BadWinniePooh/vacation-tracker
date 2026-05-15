@@ -76,8 +76,11 @@ app.use(helmet({
     directives: {
       defaultSrc: ["'self'"],
       // Babel Standalone requires unsafe-eval for in-browser JSX compilation.
-      // To remove this directive, pre-compile the JSX files with a build tool.
-      scriptSrc: ["'self'", 'https://unpkg.com', "'unsafe-eval'"],
+      // Babel Standalone fetches .jsx files via XHR, transpiles them, then
+      // injects the result as inline <script> blocks — both 'unsafe-eval'
+      // (for eval-like execution) and 'unsafe-inline' (for inline injection)
+      // are required. To remove both, pre-compile the JSX with a build tool.
+      scriptSrc: ["'self'", 'https://unpkg.com', "'unsafe-eval'", "'unsafe-inline'"],
       styleSrc: ["'self'", 'https://unpkg.com', 'https://fonts.googleapis.com', "'unsafe-inline'"],
       fontSrc: ["'self'", 'https://fonts.gstatic.com'],
       // OpenStreetMap tiles + base64-encoded photos stored in state
