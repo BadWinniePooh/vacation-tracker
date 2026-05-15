@@ -66,6 +66,87 @@ function redactForGuest(state) {
   return { ...state, cities };
 }
 
+// Filter state to only include travellers linked to the user and cities they participate in.
+function redactForUser(state, travellerIds) {
+  if (!state) return state;
+  const tids = new Set(travellerIds);
+  const users = {};
+  for (const [id, u] of Object.entries(state.users || {})) {
+    if (tids.has(id)) users[id] = u;
+  }
+  const cities = {};
+  for (const [k, c] of Object.entries(state.cities || {})) {
+    if ((c.participants || []).some(p => tids.has(p))) cities[k] = c;
+  }
+  const countries = {};
+  for (const c of Object.values(cities)) {
+    if (!countries[c.country]) countries[c.country] = { cities: [] };
+    if (!countries[c.country].cities.includes(c.name)) countries[c.country].cities.push(c.name);
+  }
+  return { ...state, users, cities, countries };
+}
+
+// Merge incoming state from a regular (non-admin) user.
+// Enforces that users may only modify their own linked travellers and
+// cities they participate in; other users' data in the base is preserved.
+function mergeStatesForUser(base, incoming, travellerIds) {
+  const tids = new Set(travellerIds);
+
+  const users = { ...base.users };
+  for (const [id, u] of Object.entries(incoming.users || {})) {
+    if (tids.has(id) && (!users[id] || (u._ts || 0) >= (users[id]._ts || 0))) {
+      users[id] = u;
+    }
+  }
+
+  const cities = { ...base.cities };
+  // Apply updates from incoming (only for cities with linked-traveller involvement)
+  for (const [k, c] of Object.entries(incoming.cities || {})) {
+    const baseCity = cities[k];
+    if (!baseCity) {
+      // New city: accept only if a linked traveller is listed as participant
+      if ((c.participants || []).some(p => tids.has(p))) cities[k] = c;
+    } else if ((c._ts || 0) >= (baseCity._ts || 0)) {
+      // Updated city: non-linked participants from base are always preserved
+      const nonLinked = (baseCity.participants || []).filter(p => !tids.has(p));
+      const linked = (c.participants || []).filter(p => tids.has(p));
+      const merged = [...new Set([...nonLinked, ...linked])];
+      if (merged.length > 0) {
+        cities[k] = { ...c, participants: merged };
+      } else {
+        delete cities[k];
+      }
+    }
+  }
+  // Cities absent from incoming: if user had linked participants there, remove them
+  for (const [k, baseCity] of Object.entries(base.cities || {})) {
+    if (cities[k] && !(k in incoming.cities)) {
+      const linkedParts = (baseCity.participants || []).filter(p => tids.has(p));
+      if (linkedParts.length > 0) {
+        const nonLinked = (baseCity.participants || []).filter(p => !tids.has(p));
+        if (nonLinked.length === 0) {
+          delete cities[k];
+        } else {
+          cities[k] = { ...baseCity, participants: nonLinked };
+        }
+      }
+    }
+  }
+
+  const ctById = {};
+  for (const t of [...(base.customTypes || []), ...(incoming.customTypes || [])]) {
+    if (!ctById[t.id] || (t._ts || 0) >= (ctById[t.id]._ts || 0)) ctById[t.id] = t;
+  }
+
+  const countries = {};
+  for (const c of Object.values(cities)) {
+    if (!countries[c.country]) countries[c.country] = { cities: [] };
+    if (!countries[c.country].cities.includes(c.name)) countries[c.country].cities.push(c.name);
+  }
+
+  return { ...incoming, users, cities, countries, customTypes: Object.values(ctById) };
+}
+
 // Basic structural validation — reject payloads that are clearly not app state
 function isValidStateBody(body) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return false;
@@ -549,7 +630,12 @@ app.get('/api/state', async (req, res) => {
     const result = await pool.query("SELECT data FROM app_state WHERE id = 'default'");
     const state = result.rows.length > 0 ? result.rows[0].data : null;
     const isAuth = !!(req.session && req.session.userId);
-    res.json(isAuth ? state : redactForGuest(state));
+    if (!isAuth) return res.json(redactForGuest(state));
+    // Admins receive the full state so the user-management panel can list all travellers.
+    // Regular users receive only their linked travellers and the cities they participate in.
+    if (req.session.role === 'admin') return res.json(state);
+    const travellerIds = await getTravellerIds(req.session.userId);
+    res.json(redactForUser(state, travellerIds));
   } catch (e) {
     console.error('GET /api/state:', e.message);
     res.status(500).json({ error: 'Database error' });
@@ -561,6 +647,10 @@ app.put('/api/state', requireAuth, writeLimiter, async (req, res) => {
     return res.status(400).json({ error: 'Invalid state payload' });
   }
 
+  const isAdmin = req.session.role === 'admin';
+  // Fetch linked travellers outside the transaction (read-only, no locking needed)
+  const travellerIds = isAdmin ? null : await getTravellerIds(req.session.userId);
+
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -568,7 +658,9 @@ app.put('/api/state', requireAuth, writeLimiter, async (req, res) => {
       "SELECT data FROM app_state WHERE id = 'default' FOR UPDATE"
     );
     const base = existing.rows.length > 0 ? existing.rows[0].data : null;
-    const merged = base ? mergeStates(base, req.body) : req.body;
+    const merged = base
+      ? (isAdmin ? mergeStates(base, req.body) : mergeStatesForUser(base, req.body, travellerIds))
+      : req.body;
     await client.query(
       `INSERT INTO app_state (id, data, updated_at) VALUES ('default', $1, NOW())
        ON CONFLICT (id) DO UPDATE SET data = $1, updated_at = NOW()`,

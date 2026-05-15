@@ -422,7 +422,8 @@ function App() {
   // Authenticated users only see travellers linked to their account.
   const linkedTravellers = useMemo(() => {
     if (!root) return {};
-    if (!isAuth || !authUser?.travellerIds?.length) return root.users || {};
+    if (!isAuth) return root.users || {};          // unauthenticated: all visible
+    if (!authUser?.travellerIds?.length) return {}; // authenticated, no links: nothing visible
     const tids = new Set(authUser.travellerIds);
     return Object.fromEntries(Object.entries(root.users || {}).filter(([id]) => tids.has(id)));
   }, [root?.users, isAuth, authUser?.travellerIds]);
@@ -496,6 +497,18 @@ function App() {
 
   // === User mutators ===
   function addUser(name) {
+    const slug = (name || '').trim().toLowerCase();
+    // Link to an existing traveller with the same name rather than creating a duplicate.
+    const existing = Object.entries(root.users).find(([, u]) => u.name.trim().toLowerCase() === slug);
+    if (existing) {
+      const [existingId] = existing;
+      setRoot(prev => ({ ...prev, currentUser: existingId }));
+      if (isAuth && authUser && !(authUser.travellerIds || []).includes(existingId)) {
+        updateMyTravellers([...(authUser.travellerIds || []), existingId]);
+      }
+      setSelectedCity(null);
+      return;
+    }
     const used = new Set(Object.values(root.users).map(u => u.color));
     const color = USER_COLORS.find(c => !used.has(c)) || USER_COLORS[Object.keys(root.users).length % USER_COLORS.length];
     const u = makeUser(name || 'New traveller', color);
