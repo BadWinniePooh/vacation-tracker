@@ -798,6 +798,12 @@ input, textarea, select { font-family: inherit; color: inherit; }
   transition: all 0.12s;
 }
 .user-add-btn:hover { background: var(--bg-soft); color: var(--ink); }
+.user-menu-empty {
+  padding: 8px 12px;
+  font-size: 12px;
+  color: var(--ink-mute);
+  font-style: italic;
+}
 
 /* === Type filter chips === */
 .type-filter { margin-bottom: 14px; }

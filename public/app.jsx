@@ -419,8 +419,18 @@ function App() {
   useLayoutEffect(() => { applyPalette(t.palette); }, [t.palette]);
   useEffect(() => { document.documentElement.lang = t.language; }, [t.language]);
 
+  // Authenticated users only see travellers linked to their account.
+  const linkedTravellers = useMemo(() => {
+    if (!root) return {};
+    if (!isAuth || !authUser?.travellerIds?.length) return root.users || {};
+    const tids = new Set(authUser.travellerIds);
+    return Object.fromEntries(Object.entries(root.users || {}).filter(([id]) => tids.has(id)));
+  }, [root?.users, isAuth, authUser?.travellerIds]);
+
   // Derive from root (safe to read as null — hooks below guard on currentUser)
-  const currentUser = root ? root.users[root.currentUser] : null;
+  const currentUser = root
+    ? (linkedTravellers[root.currentUser] ?? Object.values(linkedTravellers)[0] ?? null)
+    : null;
   const customTypes = root ? (root.customTypes || []) : [];
   const effectiveTypes = useEffectiveTypes(customTypes);
 
@@ -486,18 +496,20 @@ function App() {
 
   // === User mutators ===
   function addUser(name) {
-    setRoot(prev => {
-      const used = new Set(Object.values(prev.users).map(u => u.color));
-      const color = USER_COLORS.find(c => !used.has(c)) || USER_COLORS[Object.keys(prev.users).length % USER_COLORS.length];
-      const u = makeUser(name || 'New traveller', color);
-      return { ...prev, currentUser: u.id, users: { ...prev.users, [u.id]: u } };
-    });
+    const used = new Set(Object.values(root.users).map(u => u.color));
+    const color = USER_COLORS.find(c => !used.has(c)) || USER_COLORS[Object.keys(root.users).length % USER_COLORS.length];
+    const u = makeUser(name || 'New traveller', color);
+    setRoot(prev => ({ ...prev, currentUser: u.id, users: { ...prev.users, [u.id]: u } }));
+    if (isAuth && authUser) {
+      updateMyTravellers([...(authUser.travellerIds || []), u.id]);
+    }
     setSelectedCity(null);
   }
   function removeUser(id) {
+    const linkedIds = Object.keys(linkedTravellers);
+    if (linkedIds.length <= 1) { alert(tr('cantRemoveLast')); return; }
+    const nextLinked = linkedIds.find(tid => tid !== id);
     setRoot(prev => {
-      const ids = Object.keys(prev.users);
-      if (ids.length <= 1) { alert(tr('cantRemoveLast')); return prev; }
       const users = { ...prev.users }; delete users[id];
       const cities = {};
       for (const [k, c] of Object.entries(prev.cities || {})) {
@@ -509,9 +521,12 @@ function App() {
         if (!countries[c.country]) countries[c.country] = { cities: [] };
         countries[c.country].cities.push(c.name);
       }
-      const nextCurrent = prev.currentUser === id ? Object.keys(users)[0] : prev.currentUser;
+      const nextCurrent = prev.currentUser === id ? (nextLinked || Object.keys(users)[0]) : prev.currentUser;
       return { ...prev, currentUser: nextCurrent, users, cities, countries };
     });
+    if (isAuth && authUser) {
+      updateMyTravellers((authUser.travellerIds || []).filter(x => x !== id));
+    }
     setSelectedCity(null);
   }
   function renameUser(id, name) {
@@ -666,7 +681,7 @@ function App() {
           {isAuth ? (
             <UserSwitcher
               tr={tr}
-              users={root.users}
+              users={linkedTravellers}
               currentUser={currentUser}
               open={userMenuOpen}
               onToggle={() => setUserMenuOpen(o => !o)}
@@ -675,11 +690,6 @@ function App() {
               onAdd={addUser}
               onRemove={removeUser}
               onRename={renameUser}
-              authUser={authUser}
-              onLinkTraveller={(tid, shouldLink) => {
-                const cur = authUser?.travellerIds || [];
-                updateMyTravellers(shouldLink ? [...cur, tid] : cur.filter(x => x !== tid));
-              }}
             />
           ) : (
             <button className="auth-btn" onClick={() => setShowLogin(true)}>Sign in</button>
@@ -764,7 +774,7 @@ function App() {
           <DetailPanel
             tr={tr}
             city={selected}
-            users={root.users}
+            users={linkedTravellers}
             currentUserId={root.currentUser}
             types={effectiveTypes}
             customTypes={customTypes}
@@ -801,7 +811,7 @@ function App() {
             tr={tr}
             data={filteredData}
             allCities={root.cities}
-            users={root.users}
+            users={linkedTravellers}
             currentUserId={root.currentUser}
             filter={tab}
             types={effectiveTypes}
@@ -907,7 +917,7 @@ function countByType(cities) {
 }
 
 // === User Switcher ===
-function UserSwitcher({ tr, users, currentUser, open, onToggle, onClose, onSwitch, onAdd, onRemove, onRename, authUser, onLinkTraveller }) {
+function UserSwitcher({ tr, users, currentUser, open, onToggle, onClose, onSwitch, onAdd, onRemove, onRename }) {
   const [renaming, setRenaming] = useState(null);
   const [newName, setNewName] = useState("");
   const rootRef = useRef(null);
@@ -918,67 +928,63 @@ function UserSwitcher({ tr, users, currentUser, open, onToggle, onClose, onSwitc
     return () => document.removeEventListener('mousedown', onDoc);
   }, [open]);
 
-  if (!currentUser) return null;
   const userList = Object.values(users);
-  const myTravellerIds = authUser?.travellerIds || [];
 
   return (
     <div className="user-switcher" ref={rootRef}>
       <button className="user-chip" onClick={onToggle}>
-        <span className="user-avatar" style={{ background: currentUser.color }}>
-          {currentUser.name.slice(0, 1).toUpperCase()}
-        </span>
-        <span className="user-name">{currentUser.name}</span>
+        {currentUser ? (
+          <>
+            <span className="user-avatar" style={{ background: currentUser.color }}>
+              {currentUser.name.slice(0, 1).toUpperCase()}
+            </span>
+            <span className="user-name">{currentUser.name}</span>
+          </>
+        ) : (
+          <span className="user-name">No traveller</span>
+        )}
         <span className="user-caret">▾</span>
       </button>
       {open && (
         <div className="user-menu">
           <div className="user-menu-head">{tr('travellers')}</div>
-          {userList.map(u => {
-            const isLinked = myTravellerIds.includes(u.id);
-            return (
-              <div key={u.id} className={`user-row ${u.id === currentUser.id ? 'is-current' : ''}`}>
-                <span className="user-avatar sm" style={{ background: u.color }}>
-                  {u.name.slice(0, 1).toUpperCase()}
-                </span>
-                {renaming === u.id ? (
-                  <input
-                    className="user-rename"
-                    value={newName}
-                    autoFocus
-                    onChange={(e) => setNewName(e.target.value)}
-                    onBlur={() => {
-                      if (newName.trim()) onRename(u.id, newName.trim());
-                      setRenaming(null);
-                    }}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter') e.target.blur();
-                      if (e.key === 'Escape') { setRenaming(null); }
-                    }}
-                  />
-                ) : (
-                  <span
-                    className="user-row-name"
-                    onClick={() => onSwitch(u.id)}
-                    onDoubleClick={() => { setRenaming(u.id); setNewName(u.name); }}
-                    title={tr('switchTo') + ' ' + u.name}
-                  >{u.name}</span>
-                )}
-                {onLinkTraveller && (
-                  <button
-                    className={`traveller-link-btn ${isLinked ? 'is-linked' : ''}`}
-                    title={isLinked ? 'Unlink my account from this traveller' : 'Link my account to this traveller'}
-                    onClick={(e) => { e.stopPropagation(); onLinkTraveller(u.id, !isLinked); }}
-                  >{isLinked ? '🔗' : '⬜'}</button>
-                )}
-                {userList.length > 1 && (
-                  <button className="user-row-del" onClick={() => {
-                    if (confirm(tr('confirmRemoveUser', u.name))) onRemove(u.id);
-                  }} title={tr('removeTraveller')}>×</button>
-                )}
-              </div>
-            );
-          })}
+          {userList.length === 0 ? (
+            <div className="user-menu-empty">No linked travellers</div>
+          ) : userList.map(u => (
+            <div key={u.id} className={`user-row ${u.id === currentUser?.id ? 'is-current' : ''}`}>
+              <span className="user-avatar sm" style={{ background: u.color }}>
+                {u.name.slice(0, 1).toUpperCase()}
+              </span>
+              {renaming === u.id ? (
+                <input
+                  className="user-rename"
+                  value={newName}
+                  autoFocus
+                  onChange={(e) => setNewName(e.target.value)}
+                  onBlur={() => {
+                    if (newName.trim()) onRename(u.id, newName.trim());
+                    setRenaming(null);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') e.target.blur();
+                    if (e.key === 'Escape') { setRenaming(null); }
+                  }}
+                />
+              ) : (
+                <span
+                  className="user-row-name"
+                  onClick={() => onSwitch(u.id)}
+                  onDoubleClick={() => { setRenaming(u.id); setNewName(u.name); }}
+                  title={tr('switchTo') + ' ' + u.name}
+                >{u.name}</span>
+              )}
+              {userList.length > 1 && (
+                <button className="user-row-del" onClick={() => {
+                  if (confirm(tr('confirmRemoveUser', u.name))) onRemove(u.id);
+                }} title={tr('removeTraveller')}>×</button>
+              )}
+            </div>
+          ))}
           <button className="user-add-btn" onClick={() => {
             const name = prompt(tr('travellerName') + ':', '');
             if (name && name.trim()) onAdd(name.trim());
