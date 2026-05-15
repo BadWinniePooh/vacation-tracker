@@ -6,6 +6,7 @@ const PRECACHE = [
   '/app.jsx',
   '/map.jsx',
   '/tweaks-panel.jsx',
+  '/sw-register.js',
   '/manifest.json',
   '/icons/icon.svg',
 ];

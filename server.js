@@ -77,15 +77,15 @@ app.use(helmet({
       defaultSrc: ["'self'"],
       // Babel Standalone requires unsafe-eval for in-browser JSX compilation.
       // To remove this directive, pre-compile the JSX files with a build tool.
-      scriptSrc: ["'self'", 'unpkg.com', "'unsafe-eval'"],
-      styleSrc: ["'self'", 'unpkg.com', 'fonts.googleapis.com', "'unsafe-inline'"],
-      fontSrc: ["'self'", 'fonts.gstatic.com'],
+      scriptSrc: ["'self'", 'https://unpkg.com', "'unsafe-eval'"],
+      styleSrc: ["'self'", 'https://unpkg.com', 'https://fonts.googleapis.com', "'unsafe-inline'"],
+      fontSrc: ["'self'", 'https://fonts.gstatic.com'],
       // OpenStreetMap tiles + base64-encoded photos stored in state
-      imgSrc: ["'self'", 'tile.openstreetmap.org', 'data:', 'blob:'],
+      imgSrc: ["'self'", 'https://tile.openstreetmap.org', 'data:', 'blob:'],
       connectSrc: [
         "'self'",
-        'cdn.jsdelivr.net',             // world-atlas GeoJSON for the map
-        'nominatim.openstreetmap.org',  // city geocoding / search
+        'https://cdn.jsdelivr.net',
+        'https://nominatim.openstreetmap.org',
       ],
       workerSrc: ["'self'"],
       manifestSrc: ["'self'"],
