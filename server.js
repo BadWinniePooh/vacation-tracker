@@ -89,13 +89,28 @@ function redactForUser(state, travellerIds) {
 // Merge incoming state from a regular (non-admin) user.
 // Enforces that users may only modify their own linked travellers and
 // cities they participate in; other users' data in the base is preserved.
-function mergeStatesForUser(base, incoming, travellerIds) {
+// userId is req.session.userId (integer) used to check traveller ownership.
+function mergeStatesForUser(base, incoming, travellerIds, userId) {
   const tids = new Set(travellerIds);
 
   const users = { ...base.users };
   for (const [id, u] of Object.entries(incoming.users || {})) {
-    if (tids.has(id) && (!users[id] || (u._ts || 0) >= (users[id]._ts || 0))) {
+    if (!tids.has(id)) continue;
+    const baseUser = users[id];
+    if (!baseUser) {
+      // New traveller the user just created — accepted because they're linked.
+      // Preserve whatever ownerId the client set (validated by claim endpoint).
       users[id] = u;
+      continue;
+    }
+    if ((u._ts || 0) >= (baseUser._ts || 0)) {
+      // Only the owner may update traveller properties (name, color, etc.).
+      // Legacy travellers without ownerId are treated as editable (backward compat).
+      const isOwner = !baseUser.ownerId || baseUser.ownerId === userId;
+      if (isOwner) {
+        // Keep the stored ownerId authoritative — client cannot overwrite it.
+        users[id] = { ...u, ownerId: baseUser.ownerId ?? u.ownerId };
+      }
     }
   }
 
@@ -579,6 +594,158 @@ app.delete('/api/admin/users/:id', requireAuth, requireAdmin, writeLimiter, asyn
   }
 });
 
+// --- Traveller ownership & sharing ---
+
+// Claim ownership of a newly-created traveller (must not already be claimed).
+// Also ensures the caller is linked to the traveller.
+app.post('/api/travellers/:id/claim', requireAuth, writeLimiter, async (req, res) => {
+  const travellerId = sanitiseTravellerId(req.params.id);
+  if (!travellerId) return res.status(400).json({ error: 'Invalid traveller ID' });
+  try {
+    const r = await pool.query(
+      'INSERT INTO traveller_owners (traveller_id, owner_user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING owner_user_id',
+      [travellerId, req.session.userId]
+    );
+    if (r.rows.length === 0) {
+      // Already claimed — verify it's by this user
+      const existing = await pool.query('SELECT owner_user_id FROM traveller_owners WHERE traveller_id = $1', [travellerId]);
+      if (existing.rows.length && existing.rows[0].owner_user_id !== req.session.userId) {
+        return res.status(403).json({ error: 'Traveller already owned by another user' });
+      }
+    }
+    await pool.query(
+      'INSERT INTO user_traveller_links (user_id, traveller_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+      [req.session.userId, travellerId]
+    );
+    res.json({ ok: true, ownerId: req.session.userId });
+  } catch (e) {
+    console.error('POST /api/travellers/:id/claim:', e.message);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// Get sharing info (linked users) for a traveller. Only the owner may call this.
+app.get('/api/travellers/:id/sharing', requireAuth, async (req, res) => {
+  const travellerId = sanitiseTravellerId(req.params.id);
+  if (!travellerId) return res.status(400).json({ error: 'Invalid traveller ID' });
+  try {
+    const ownership = await pool.query('SELECT owner_user_id FROM traveller_owners WHERE traveller_id = $1', [travellerId]);
+    if (!ownership.rows.length || ownership.rows[0].owner_user_id !== req.session.userId) {
+      return res.status(403).json({ error: 'Only the traveller owner can view sharing' });
+    }
+    const links = await pool.query(
+      `SELECT u.id, u.username FROM user_traveller_links l
+       JOIN app_users u ON u.id = l.user_id
+       WHERE l.traveller_id = $1`,
+      [travellerId]
+    );
+    res.json({
+      ownerId: req.session.userId,
+      sharedWith: links.rows.map(r => ({ id: r.id, username: r.username, isOwner: r.id === req.session.userId })),
+    });
+  } catch (e) {
+    console.error('GET /api/travellers/:id/sharing:', e.message);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// Share a traveller with another user by username (owner only).
+app.post('/api/travellers/:id/share', requireAuth, writeLimiter, async (req, res) => {
+  const travellerId = sanitiseTravellerId(req.params.id);
+  if (!travellerId) return res.status(400).json({ error: 'Invalid traveller ID' });
+  const { username } = req.body || {};
+  if (!username || typeof username !== 'string') return res.status(400).json({ error: 'Username required' });
+  try {
+    const ownership = await pool.query('SELECT owner_user_id FROM traveller_owners WHERE traveller_id = $1', [travellerId]);
+    if (!ownership.rows.length || ownership.rows[0].owner_user_id !== req.session.userId) {
+      return res.status(403).json({ error: 'Only the traveller owner can share it' });
+    }
+    const target = await pool.query('SELECT id, username FROM app_users WHERE username = $1', [sanitiseUsername(username)]);
+    if (!target.rows.length) return res.status(404).json({ error: 'User not found' });
+    const targetUser = target.rows[0];
+    if (targetUser.id === req.session.userId) return res.status(400).json({ error: 'Already the owner' });
+    await pool.query(
+      'INSERT INTO user_traveller_links (user_id, traveller_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+      [targetUser.id, travellerId]
+    );
+    res.json({ ok: true, user: { id: targetUser.id, username: targetUser.username } });
+  } catch (e) {
+    console.error('POST /api/travellers/:id/share:', e.message);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// Revoke another user's access to a traveller (owner only, cannot remove own access).
+app.delete('/api/travellers/:id/share/:userId', requireAuth, writeLimiter, async (req, res) => {
+  const travellerId = sanitiseTravellerId(req.params.id);
+  const targetUserId = parseInt(req.params.userId, 10);
+  if (!travellerId || !Number.isInteger(targetUserId)) return res.status(400).json({ error: 'Invalid parameters' });
+  if (targetUserId === req.session.userId) return res.status(400).json({ error: 'Cannot revoke your own access as owner' });
+  try {
+    const ownership = await pool.query('SELECT owner_user_id FROM traveller_owners WHERE traveller_id = $1', [travellerId]);
+    if (!ownership.rows.length || ownership.rows[0].owner_user_id !== req.session.userId) {
+      return res.status(403).json({ error: 'Only the traveller owner can remove sharing' });
+    }
+    await pool.query('DELETE FROM user_traveller_links WHERE user_id = $1 AND traveller_id = $2', [targetUserId, travellerId]);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('DELETE /api/travellers/:id/share/:userId:', e.message);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// Delete a traveller entirely (owner or admin only).
+// Removes it from the shared state, all links, and the ownership record.
+app.delete('/api/travellers/:id', requireAuth, writeLimiter, async (req, res) => {
+  const travellerId = sanitiseTravellerId(req.params.id);
+  if (!travellerId) return res.status(400).json({ error: 'Invalid traveller ID' });
+  const isAdmin = req.session.role === 'admin';
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    if (!isAdmin) {
+      const ownership = await client.query('SELECT owner_user_id FROM traveller_owners WHERE traveller_id = $1', [travellerId]);
+      if (!ownership.rows.length || ownership.rows[0].owner_user_id !== req.session.userId) {
+        await client.query('ROLLBACK');
+        return res.status(403).json({ error: 'Only the traveller owner can delete it' });
+      }
+    }
+    // Remove from shared state
+    const stateResult = await client.query("SELECT data FROM app_state WHERE id = 'default' FOR UPDATE");
+    if (stateResult.rows.length > 0 && stateResult.rows[0].data) {
+      const state = stateResult.rows[0].data;
+      const users = { ...(state.users || {}) };
+      delete users[travellerId];
+      const cities = {};
+      for (const [k, c] of Object.entries(state.cities || {})) {
+        const p = (c.participants || []).filter(x => x !== travellerId);
+        if (p.length > 0) cities[k] = { ...c, participants: p };
+      }
+      const countries = {};
+      for (const c of Object.values(cities)) {
+        if (!countries[c.country]) countries[c.country] = { cities: [] };
+        if (!countries[c.country].cities.includes(c.name)) countries[c.country].cities.push(c.name);
+      }
+      await client.query(
+        "UPDATE app_state SET data = $1, updated_at = NOW() WHERE id = 'default'",
+        [{ ...state, users, cities, countries }]
+      );
+    }
+    await client.query('DELETE FROM user_traveller_links WHERE traveller_id = $1', [travellerId]);
+    await client.query('DELETE FROM traveller_owners WHERE traveller_id = $1', [travellerId]);
+    await client.query('COMMIT');
+    const clientId = sanitiseClientId(req.headers['x-client-id'] || '');
+    for (const c of clients) c.write(`data: ${JSON.stringify({ clientId })}\n\n`);
+    res.json({ ok: true });
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('DELETE /api/travellers/:id:', e.message);
+    res.status(500).json({ error: 'Database error' });
+  } finally {
+    client.release();
+  }
+});
+
 // --- App state ---
 async function initDB() {
   await pool.query(`
@@ -606,6 +773,16 @@ async function initDB() {
       user_id    INTEGER NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
       traveller_id TEXT  NOT NULL,
       PRIMARY KEY (user_id, traveller_id)
+    )
+  `);
+
+  // Tracks who created (owns) each traveller. The owner is the only account
+  // allowed to share the traveller with others, revoke access, or delete it.
+  // ON DELETE CASCADE removes ownership when the owning account is deleted.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS traveller_owners (
+      traveller_id  TEXT    PRIMARY KEY,
+      owner_user_id INTEGER NOT NULL REFERENCES app_users(id) ON DELETE CASCADE
     )
   `);
 
@@ -659,7 +836,7 @@ app.put('/api/state', requireAuth, writeLimiter, async (req, res) => {
     );
     const base = existing.rows.length > 0 ? existing.rows[0].data : null;
     const merged = base
-      ? (isAdmin ? mergeStates(base, req.body) : mergeStatesForUser(base, req.body, travellerIds))
+      ? (isAdmin ? mergeStates(base, req.body) : mergeStatesForUser(base, req.body, travellerIds, req.session.userId))
       : req.body;
     await client.query(
       `INSERT INTO app_state (id, data, updated_at) VALUES ('default', $1, NOW())

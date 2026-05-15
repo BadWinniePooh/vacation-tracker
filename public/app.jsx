@@ -29,8 +29,8 @@ const CUSTOM_TYPE_GLYPHS = ["✦","◉","✺","❀","♨","☀","♪","☂","⚑
 
 function uid() { return Math.random().toString(36).slice(2, 9); }
 
-function makeUser(name, color) {
-  return { id: uid(), name, color, _ts: Date.now() };
+function makeUser(name, color, ownerId) {
+  return { id: uid(), name, color, _ts: Date.now(), ...(ownerId != null ? { ownerId } : {}) };
 }
 
 function isValidState(data) {
@@ -511,10 +511,13 @@ function App() {
     }
     const used = new Set(Object.values(root.users).map(u => u.color));
     const color = USER_COLORS.find(c => !used.has(c)) || USER_COLORS[Object.keys(root.users).length % USER_COLORS.length];
-    const u = makeUser(name || 'New traveller', color);
+    const u = makeUser(name || 'New traveller', color, authUser?.id ?? null);
     setRoot(prev => ({ ...prev, currentUser: u.id, users: { ...prev.users, [u.id]: u } }));
     if (isAuth && authUser) {
-      updateMyTravellers([...(authUser.travellerIds || []), u.id]);
+      // Claim ownership and create the link in one server round-trip.
+      // Optimistically update local travellerIds so linkedTravellers reflects the new entry.
+      setAuthUser(prev => prev ? { ...prev, travellerIds: [...(prev.travellerIds || []), u.id] } : prev);
+      fetch(`/api/travellers/${u.id}/claim`, { method: 'POST' }).catch(() => {});
     }
     setSelectedCity(null);
   }
@@ -522,23 +525,39 @@ function App() {
     const linkedIds = Object.keys(linkedTravellers);
     if (linkedIds.length <= 1) { alert(tr('cantRemoveLast')); return; }
     const nextLinked = linkedIds.find(tid => tid !== id);
-    setRoot(prev => {
-      const users = { ...prev.users }; delete users[id];
-      const cities = {};
-      for (const [k, c] of Object.entries(prev.cities || {})) {
-        const p = (c.participants || []).filter(x => x !== id);
-        if (p.length > 0) cities[k] = { ...c, participants: p };
-      }
-      const countries = {};
-      for (const c of Object.values(cities)) {
-        if (!countries[c.country]) countries[c.country] = { cities: [] };
-        countries[c.country].cities.push(c.name);
-      }
-      const nextCurrent = prev.currentUser === id ? (nextLinked || Object.keys(users)[0]) : prev.currentUser;
-      return { ...prev, currentUser: nextCurrent, users, cities, countries };
-    });
-    if (isAuth && authUser) {
-      updateMyTravellers((authUser.travellerIds || []).filter(x => x !== id));
+    const traveller = linkedTravellers[id];
+    // Legacy travellers with no ownerId are treated as owned by the current user.
+    const isOwner = !traveller?.ownerId || traveller.ownerId === authUser?.id;
+
+    if (isOwner) {
+      // Owner: delete the traveller for everyone via the server endpoint.
+      setRoot(prev => {
+        const users = { ...prev.users }; delete users[id];
+        const cities = {};
+        for (const [k, c] of Object.entries(prev.cities || {})) {
+          const p = (c.participants || []).filter(x => x !== id);
+          if (p.length > 0) cities[k] = { ...c, participants: p };
+        }
+        const countries = {};
+        for (const c of Object.values(cities)) {
+          if (!countries[c.country]) countries[c.country] = { cities: [] };
+          countries[c.country].cities.push(c.name);
+        }
+        const nextCurrent = prev.currentUser === id ? (nextLinked || Object.keys(users)[0]) : prev.currentUser;
+        return { ...prev, currentUser: nextCurrent, users, cities, countries };
+      });
+      setAuthUser(prev => prev ? { ...prev, travellerIds: (prev.travellerIds || []).filter(x => x !== id) } : prev);
+      fetch(`/api/travellers/${id}`, {
+        method: 'DELETE',
+        headers: { 'X-Client-Id': clientIdRef.current },
+      }).catch(() => {});
+    } else {
+      // Non-owner: just unlink from own account; traveller remains for others.
+      setRoot(prev => {
+        const nextCurrent = prev.currentUser === id ? (nextLinked || Object.keys(prev.users).find(k => k !== id)) : prev.currentUser;
+        return { ...prev, currentUser: nextCurrent };
+      });
+      updateMyTravellers((authUser?.travellerIds || []).filter(x => x !== id));
     }
     setSelectedCity(null);
   }
@@ -703,6 +722,7 @@ function App() {
               onAdd={addUser}
               onRemove={removeUser}
               onRename={renameUser}
+              userId={authUser?.id}
             />
           ) : (
             <button className="auth-btn" onClick={() => setShowLogin(true)}>Sign in</button>
@@ -930,16 +950,71 @@ function countByType(cities) {
 }
 
 // === User Switcher ===
-function UserSwitcher({ tr, users, currentUser, open, onToggle, onClose, onSwitch, onAdd, onRemove, onRename }) {
+function UserSwitcher({ tr, users, currentUser, open, onToggle, onClose, onSwitch, onAdd, onRemove, onRename, userId }) {
   const [renaming, setRenaming] = useState(null);
   const [newName, setNewName] = useState("");
+  // Sharing panel state
+  const [sharingFor, setSharingFor] = useState(null);
+  const [sharingInfo, setSharingInfo] = useState({});
+  const [shareInput, setShareInput] = useState('');
+  const [shareError, setShareError] = useState('');
   const rootRef = useRef(null);
+
   useEffect(() => {
     if (!open) return;
     function onDoc(e) { if (rootRef.current && !rootRef.current.contains(e.target)) onClose(); }
     document.addEventListener('mousedown', onDoc);
     return () => document.removeEventListener('mousedown', onDoc);
   }, [open]);
+  useEffect(() => {
+    if (!open) { setSharingFor(null); setShareInput(''); setShareError(''); }
+  }, [open]);
+
+  async function openSharing(tid) {
+    if (sharingFor === tid) { setSharingFor(null); return; }
+    setSharingFor(tid);
+    setSharingInfo(prev => ({ ...prev, [tid]: 'loading' }));
+    try {
+      const r = await fetch(`/api/travellers/${tid}/sharing`);
+      const data = await r.json();
+      setSharingInfo(prev => ({ ...prev, [tid]: r.ok ? data : { error: data.error } }));
+    } catch {
+      setSharingInfo(prev => ({ ...prev, [tid]: { error: 'Network error' } }));
+    }
+  }
+
+  async function shareWith(tid) {
+    setShareError('');
+    const name = shareInput.trim();
+    if (!name) return;
+    const r = await fetch(`/api/travellers/${tid}/share`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: name }),
+    });
+    const data = await r.json();
+    if (r.ok) {
+      setShareInput('');
+      setSharingInfo(prev => {
+        const info = prev[tid];
+        if (!info || typeof info !== 'object' || info.error) return prev;
+        return { ...prev, [tid]: { ...info, sharedWith: [...info.sharedWith, { ...data.user, isOwner: false }] } };
+      });
+    } else {
+      setShareError(data.error || 'Failed to share');
+    }
+  }
+
+  async function revokeAccess(tid, targetUserId) {
+    const r = await fetch(`/api/travellers/${tid}/share/${targetUserId}`, { method: 'DELETE' });
+    if (r.ok) {
+      setSharingInfo(prev => {
+        const info = prev[tid];
+        if (!info || typeof info !== 'object' || info.error) return prev;
+        return { ...prev, [tid]: { ...info, sharedWith: info.sharedWith.filter(u => u.id !== targetUserId) } };
+      });
+    }
+  }
 
   const userList = Object.values(users);
 
@@ -963,41 +1038,94 @@ function UserSwitcher({ tr, users, currentUser, open, onToggle, onClose, onSwitc
           <div className="user-menu-head">{tr('travellers')}</div>
           {userList.length === 0 ? (
             <div className="user-menu-empty">No linked travellers</div>
-          ) : userList.map(u => (
-            <div key={u.id} className={`user-row ${u.id === currentUser?.id ? 'is-current' : ''}`}>
-              <span className="user-avatar sm" style={{ background: u.color }}>
-                {u.name.slice(0, 1).toUpperCase()}
-              </span>
-              {renaming === u.id ? (
-                <input
-                  className="user-rename"
-                  value={newName}
-                  autoFocus
-                  onChange={(e) => setNewName(e.target.value)}
-                  onBlur={() => {
-                    if (newName.trim()) onRename(u.id, newName.trim());
-                    setRenaming(null);
-                  }}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') e.target.blur();
-                    if (e.key === 'Escape') { setRenaming(null); }
-                  }}
-                />
-              ) : (
-                <span
-                  className="user-row-name"
-                  onClick={() => onSwitch(u.id)}
-                  onDoubleClick={() => { setRenaming(u.id); setNewName(u.name); }}
-                  title={tr('switchTo') + ' ' + u.name}
-                >{u.name}</span>
-              )}
-              {userList.length > 1 && (
-                <button className="user-row-del" onClick={() => {
-                  if (confirm(tr('confirmRemoveUser', u.name))) onRemove(u.id);
-                }} title={tr('removeTraveller')}>×</button>
-              )}
-            </div>
-          ))}
+          ) : userList.map(u => {
+            // Legacy travellers with no ownerId are editable by the current user.
+            const isOwner = !u.ownerId || u.ownerId === userId;
+            const isCurrent = u.id === currentUser?.id;
+            const info = sharingInfo[u.id];
+            return (
+              <div key={u.id}>
+                <div className={`user-row ${isCurrent ? 'is-current' : ''}`}>
+                  <span className="user-avatar sm" style={{ background: u.color }}>
+                    {u.name.slice(0, 1).toUpperCase()}
+                  </span>
+                  {renaming === u.id ? (
+                    <input
+                      className="user-rename"
+                      value={newName}
+                      autoFocus
+                      onChange={(e) => setNewName(e.target.value)}
+                      onBlur={() => {
+                        if (newName.trim()) onRename(u.id, newName.trim());
+                        setRenaming(null);
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') e.target.blur();
+                        if (e.key === 'Escape') setRenaming(null);
+                      }}
+                    />
+                  ) : (
+                    <span
+                      className="user-row-name"
+                      onClick={() => onSwitch(u.id)}
+                      onDoubleClick={isOwner ? () => { setRenaming(u.id); setNewName(u.name); } : undefined}
+                      title={tr('switchTo') + ' ' + u.name}
+                    >{u.name}</span>
+                  )}
+                  {isOwner && (
+                    <button
+                      className={`user-row-share${sharingFor === u.id ? ' is-active' : ''}`}
+                      title="Manage sharing"
+                      onClick={(e) => { e.stopPropagation(); openSharing(u.id); }}
+                    >🔗</button>
+                  )}
+                  {isOwner ? (
+                    userList.length > 1 && (
+                      <button className="user-row-del" title="Delete for everyone" onClick={() => {
+                        if (confirm(tr('confirmRemoveUser', u.name))) onRemove(u.id);
+                      }}>×</button>
+                    )
+                  ) : (
+                    <button className="user-row-del user-row-leave" title="Leave — unlink from your account" onClick={() => {
+                      if (confirm(`Leave "${u.name}"? The owner can re-add you.`)) onRemove(u.id);
+                    }}>↩</button>
+                  )}
+                </div>
+                {sharingFor === u.id && isOwner && (
+                  <div className="sharing-panel">
+                    {info === 'loading' && <div className="sharing-status">Loading…</div>}
+                    {info && info.error && <div className="sharing-status sharing-error">{info.error}</div>}
+                    {info && !info.error && info !== 'loading' && (
+                      <>
+                        <div className="sharing-list">
+                          {info.sharedWith.filter(su => !su.isOwner).length === 0
+                            ? <div className="sharing-none">Not shared with anyone yet</div>
+                            : info.sharedWith.filter(su => !su.isOwner).map(su => (
+                              <div key={su.id} className="sharing-user">
+                                <span className="sharing-username">{su.username}</span>
+                                <button className="sharing-revoke" onClick={() => revokeAccess(u.id, su.id)} title="Revoke access">×</button>
+                              </div>
+                            ))
+                          }
+                        </div>
+                        <div className="sharing-add">
+                          <input
+                            className="sharing-input"
+                            placeholder="Username…"
+                            value={shareInput}
+                            onChange={e => { setShareInput(e.target.value); setShareError(''); }}
+                            onKeyDown={e => { if (e.key === 'Enter') shareWith(u.id); }}
+                          />
+                          <button className="sharing-btn" onClick={() => shareWith(u.id)}>Share</button>
+                        </div>
+                        {shareError && <div className="sharing-status sharing-error">{shareError}</div>}
+                      </>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })}
           <button className="user-add-btn" onClick={() => {
             const name = prompt(tr('travellerName') + ':', '');
             if (name && name.trim()) onAdd(name.trim());
