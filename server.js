@@ -87,6 +87,12 @@ function sanitiseUsername(raw) {
   return raw.replace(/[^a-zA-Z0-9_\-]/g, '').slice(0, 32);
 }
 
+// Traveller IDs are short random base-36 strings from the client
+function sanitiseTravellerId(raw) {
+  if (typeof raw !== 'string') return '';
+  return raw.replace(/[^a-zA-Z0-9_\-]/g, '').slice(0, 32);
+}
+
 const app = express();
 
 // --- Security headers (OWASP A05) ---
@@ -211,17 +217,47 @@ app.get('/api/events', (req, res) => {
   req.on('close', () => clients.delete(res));
 });
 
+// Fetch the traveller IDs linked to a given user — returns a string array.
+async function getTravellerIds(userId) {
+  const r = await pool.query(
+    'SELECT traveller_id FROM user_traveller_links WHERE user_id = $1',
+    [userId]
+  );
+  return r.rows.map(row => row.traveller_id);
+}
+
+// Replace all traveller links for a user atomically (inside an existing client).
+async function setTravellerIds(client, userId, rawIds) {
+  const ids = (Array.isArray(rawIds) ? rawIds : [])
+    .map(sanitiseTravellerId)
+    .filter(Boolean);
+  await client.query('DELETE FROM user_traveller_links WHERE user_id = $1', [userId]);
+  for (const tid of ids) {
+    await client.query(
+      'INSERT INTO user_traveller_links (user_id, traveller_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+      [userId, tid]
+    );
+  }
+  return ids;
+}
+
 // --- Auth endpoints ---
-app.get('/api/auth/status', (req, res) => {
-  if (req.session && req.session.userId) {
+app.get('/api/auth/status', async (req, res) => {
+  if (!(req.session && req.session.userId)) {
+    return res.json({ authenticated: false });
+  }
+  try {
+    const travellerIds = await getTravellerIds(req.session.userId);
     res.json({
       authenticated: true,
       id: req.session.userId,
       username: req.session.username,
       role: req.session.role,
+      travellerIds,
     });
-  } else {
-    res.json({ authenticated: false });
+  } catch (e) {
+    console.error('GET /api/auth/status:', e.message);
+    res.status(500).json({ error: 'Database error' });
   }
 });
 
@@ -249,10 +285,9 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
     req.session.userId = user.id;
     req.session.username = user.username;
     req.session.role = user.role;
-    req.session.save(err => {
-      if (err) return res.status(500).json({ error: 'Session error' });
-      res.json({ ok: true, id: user.id, username: user.username, role: user.role });
-    });
+    await new Promise((resolve, reject) => req.session.save(e => e ? reject(e) : resolve()));
+    const travellerIds = await getTravellerIds(user.id);
+    res.json({ ok: true, id: user.id, username: user.username, role: user.role, travellerIds });
   } catch (e) {
     console.error('POST /api/auth/login:', e.message);
     res.status(500).json({ error: 'Database error' });
@@ -292,13 +327,48 @@ app.put('/api/auth/password', requireAuth, writeLimiter, async (req, res) => {
   }
 });
 
+// Manage own traveller links — any authenticated user can link/unlink themselves
+app.get('/api/auth/travellers', requireAuth, async (req, res) => {
+  try {
+    res.json(await getTravellerIds(req.session.userId));
+  } catch (e) {
+    console.error('GET /api/auth/travellers:', e.message);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+app.put('/api/auth/travellers', requireAuth, writeLimiter, async (req, res) => {
+  const { travellerIds } = req.body || {};
+  if (!Array.isArray(travellerIds)) {
+    return res.status(400).json({ error: 'travellerIds must be an array' });
+  }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const ids = await setTravellerIds(client, req.session.userId, travellerIds);
+    await client.query('COMMIT');
+    res.json({ ok: true, travellerIds: ids });
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('PUT /api/auth/travellers:', e.message);
+    res.status(500).json({ error: 'Database error' });
+  } finally {
+    client.release();
+  }
+});
+
 // --- Admin: user management ---
 app.get('/api/admin/users', requireAuth, requireAdmin, async (req, res) => {
   try {
-    const result = await pool.query(
-      'SELECT id, username, role, created_at FROM app_users ORDER BY created_at'
-    );
-    res.json(result.rows);
+    const result = await pool.query(`
+      SELECT u.id, u.username, u.role, u.created_at,
+        ARRAY_REMOVE(ARRAY_AGG(l.traveller_id), NULL) AS traveller_ids
+      FROM app_users u
+      LEFT JOIN user_traveller_links l ON l.user_id = u.id
+      GROUP BY u.id
+      ORDER BY u.created_at
+    `);
+    res.json(result.rows.map(r => ({ ...r, traveller_ids: r.traveller_ids || [] })));
   } catch (e) {
     console.error('GET /api/admin/users:', e.message);
     res.status(500).json({ error: 'Database error' });
@@ -306,7 +376,7 @@ app.get('/api/admin/users', requireAuth, requireAdmin, async (req, res) => {
 });
 
 app.post('/api/admin/users', requireAuth, requireAdmin, writeLimiter, async (req, res) => {
-  const { username, password, role = 'user' } = req.body || {};
+  const { username, password, role = 'user', travellerIds = [] } = req.body || {};
   const clean = sanitiseUsername(username || '');
   if (clean.length < 2) {
     return res.status(400).json({ error: 'Username must be 2–32 alphanumeric characters' });
@@ -317,17 +387,25 @@ app.post('/api/admin/users', requireAuth, requireAdmin, writeLimiter, async (req
   if (!['admin', 'user'].includes(role)) {
     return res.status(400).json({ error: 'Role must be admin or user' });
   }
+  const client = await pool.connect();
   try {
+    await client.query('BEGIN');
     const hash = await bcrypt.hash(password, 12);
-    const result = await pool.query(
+    const result = await client.query(
       'INSERT INTO app_users (username, password_hash, role) VALUES ($1, $2, $3) RETURNING id, username, role, created_at',
       [clean, hash, role]
     );
-    res.status(201).json(result.rows[0]);
+    const newUser = result.rows[0];
+    const linkedIds = await setTravellerIds(client, newUser.id, travellerIds);
+    await client.query('COMMIT');
+    res.status(201).json({ ...newUser, traveller_ids: linkedIds });
   } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
     if (e.code === '23505') return res.status(409).json({ error: 'Username already exists' });
     console.error('POST /api/admin/users:', e.message);
     res.status(500).json({ error: 'Database error' });
+  } finally {
+    client.release();
   }
 });
 
@@ -336,41 +414,59 @@ app.put('/api/admin/users/:id', requireAuth, requireAdmin, writeLimiter, async (
   if (!Number.isInteger(id) || id <= 0) {
     return res.status(400).json({ error: 'Invalid user ID' });
   }
-  const { password, role } = req.body || {};
+  const { password, role, travellerIds } = req.body || {};
+  const client = await pool.connect();
   try {
-    const existing = await pool.query('SELECT id, role FROM app_users WHERE id = $1', [id]);
-    if (!existing.rows.length) return res.status(404).json({ error: 'User not found' });
+    await client.query('BEGIN');
+    const existing = await client.query('SELECT id, role FROM app_users WHERE id = $1', [id]);
+    if (!existing.rows.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'User not found' });
+    }
 
     if (password !== undefined) {
       if (typeof password !== 'string' || password.length < 8) {
+        await client.query('ROLLBACK');
         return res.status(400).json({ error: 'Password must be at least 8 characters' });
       }
       const hash = await bcrypt.hash(password, 12);
-      await pool.query('UPDATE app_users SET password_hash = $1 WHERE id = $2', [hash, id]);
+      await client.query('UPDATE app_users SET password_hash = $1 WHERE id = $2', [hash, id]);
     }
 
     if (role !== undefined) {
       if (!['admin', 'user'].includes(role)) {
+        await client.query('ROLLBACK');
         return res.status(400).json({ error: 'Role must be admin or user' });
       }
       // Prevent demoting the last admin
       if (role !== 'admin' && existing.rows[0].role === 'admin') {
-        const cnt = await pool.query("SELECT COUNT(*) FROM app_users WHERE role = 'admin'");
+        const cnt = await client.query("SELECT COUNT(*) FROM app_users WHERE role = 'admin'");
         if (parseInt(cnt.rows[0].count, 10) <= 1) {
+          await client.query('ROLLBACK');
           return res.status(400).json({ error: 'Cannot demote the last admin' });
         }
       }
-      await pool.query('UPDATE app_users SET role = $1 WHERE id = $2', [role, id]);
+      await client.query('UPDATE app_users SET role = $1 WHERE id = $2', [role, id]);
     }
 
+    let linkedIds;
+    if (travellerIds !== undefined) {
+      linkedIds = await setTravellerIds(client, id, travellerIds);
+    } else {
+      linkedIds = await getTravellerIds(id);
+    }
+
+    await client.query('COMMIT');
     const result = await pool.query(
-      'SELECT id, username, role, created_at FROM app_users WHERE id = $1',
-      [id]
+      'SELECT id, username, role, created_at FROM app_users WHERE id = $1', [id]
     );
-    res.json(result.rows[0]);
+    res.json({ ...result.rows[0], traveller_ids: linkedIds });
   } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
     console.error('PUT /api/admin/users/:id:', e.message);
     res.status(500).json({ error: 'Database error' });
+  } finally {
+    client.release();
   }
 });
 
@@ -393,6 +489,7 @@ app.delete('/api/admin/users/:id', requireAuth, requireAdmin, writeLimiter, asyn
       }
     }
 
+    // Traveller links are cleaned up automatically via ON DELETE CASCADE
     await pool.query('DELETE FROM app_users WHERE id = $1', [id]);
     res.json({ ok: true });
   } catch (e) {
@@ -418,6 +515,16 @@ async function initDB() {
       password_hash TEXT NOT NULL,
       role TEXT NOT NULL DEFAULT 'user' CHECK (role IN ('admin', 'user')),
       created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+
+  // Each row links a login account to a traveller ID from the map state.
+  // ON DELETE CASCADE keeps this clean when users are deleted.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_traveller_links (
+      user_id    INTEGER NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+      traveller_id TEXT  NOT NULL,
+      PRIMARY KEY (user_id, traveller_id)
     )
   `);
 

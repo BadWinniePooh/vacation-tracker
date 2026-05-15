@@ -1506,3 +1506,55 @@ input, textarea, select { font-family: inherit; color: inherit; }
   border-radius: var(--radius-sm);
   padding: 7px 11px;
 }
+
+/* Linked traveller avatars in admin user row */
+.admin-linked-travellers {
+  display: flex;
+  gap: 3px;
+  align-items: center;
+}
+
+/* Traveller section in admin edit/create forms */
+.admin-traveller-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.admin-traveller-picker {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.admin-traveller-opt {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px 4px 6px;
+  border: 1.5px solid var(--line);
+  border-radius: 20px;
+  cursor: pointer;
+  font-size: 13px;
+  transition: border-color 0.15s, background 0.15s;
+}
+.admin-traveller-opt input { display: none; }
+.admin-traveller-opt.is-checked {
+  border-color: var(--accent);
+  background: oklch(58% 0.14 28 / 8%);
+}
+.admin-traveller-opt:hover { border-color: var(--ink-mute); }
+.admin-traveller-name { line-height: 1; }
+
+/* Link toggle button in UserSwitcher */
+.traveller-link-btn {
+  background: none;
+  border: none;
+  font-size: 13px;
+  opacity: 0.35;
+  cursor: pointer;
+  padding: 0 2px;
+  line-height: 1;
+  transition: opacity 0.15s;
+}
+.traveller-link-btn.is-linked { opacity: 1; }
+.traveller-link-btn:hover { opacity: 0.7; }
+.traveller-link-btn.is-linked:hover { opacity: 0.65; }

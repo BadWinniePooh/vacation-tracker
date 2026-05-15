@@ -283,6 +283,7 @@ function App() {
   const saveTimerRef = useRef(null);
   const settingsAppliedRef = useRef(false);
   const clientIdRef = useRef(Math.random().toString(36).slice(2, 10));
+  const didAutoSwitchRef = useRef(false);
 
   const [authStatus, setAuthStatus] = useState('loading');
   const [authUser, setAuthUser] = useState(null); // { id, username, role } | null
@@ -314,7 +315,7 @@ function App() {
     ]).then(([authData, stateData]) => {
       setAuthStatus(authData.authenticated ? 'authenticated' : 'unauthenticated');
       if (authData.authenticated) {
-        setAuthUser({ id: authData.id, username: authData.username, role: authData.role });
+        setAuthUser({ id: authData.id, username: authData.username, role: authData.role, travellerIds: authData.travellerIds || [] });
       }
       if (isValidState(stateData)) {
         setRoot({ ...stateData, currentUser: loadCurrentUser(stateData) });
@@ -335,8 +336,9 @@ function App() {
       });
       const d = await res.json();
       if (res.ok) {
+        didAutoSwitchRef.current = false;
         setAuthStatus('authenticated');
-        setAuthUser({ id: d.id, username: d.username, role: d.role });
+        setAuthUser({ id: d.id, username: d.username, role: d.role, travellerIds: d.travellerIds || [] });
         setShowLogin(false);
         await refreshState();
       } else {
@@ -350,6 +352,7 @@ function App() {
 
   async function handleLogout() {
     await fetch('/api/auth/logout', { method: 'POST' }).catch(() => {});
+    didAutoSwitchRef.current = false;
     setAuthStatus('unauthenticated');
     setAuthUser(null);
     await refreshState();
@@ -401,6 +404,16 @@ function App() {
     };
     return () => es.close();
   }, []);
+
+  // Auto-switch to the user's linked traveller once per login session.
+  // Inline setRoot rather than calling switchUser (which is defined after the early return).
+  useEffect(() => {
+    if (didAutoSwitchRef.current || !isAuth || !root || !authUser?.travellerIds?.length) return;
+    const linked = authUser.travellerIds.filter(tid => root.users[tid]);
+    if (linked.length === 0 || linked.includes(root.currentUser)) return;
+    didAutoSwitchRef.current = true;
+    setRoot(prev => prev ? { ...prev, currentUser: linked[0] } : prev);
+  }, [isAuth, root, authUser]);
 
   // useLayoutEffect so CSS vars are set before child effects (repaintCountries) read them
   useLayoutEffect(() => { applyPalette(t.palette); }, [t.palette]);
@@ -508,6 +521,17 @@ function App() {
     setRoot(prev => ({ ...prev, currentUser: id }));
     setSelectedCity(null);
     setUserMenuOpen(false);
+  }
+
+  async function updateMyTravellers(travellerIds) {
+    const res = await fetch('/api/auth/travellers', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ travellerIds }),
+    });
+    if (res.ok) {
+      setAuthUser(prev => prev ? { ...prev, travellerIds } : prev);
+    }
   }
 
   // === City mutators (shared store) ===
@@ -651,6 +675,11 @@ function App() {
               onAdd={addUser}
               onRemove={removeUser}
               onRename={renameUser}
+              authUser={authUser}
+              onLinkTraveller={(tid, shouldLink) => {
+                const cur = authUser?.travellerIds || [];
+                updateMyTravellers(shouldLink ? [...cur, tid] : cur.filter(x => x !== tid));
+              }}
             />
           ) : (
             <button className="auth-btn" onClick={() => setShowLogin(true)}>Sign in</button>
@@ -826,15 +855,17 @@ function App() {
           value={t.collapseVisited}
           onChange={(v) => setTweak('collapseVisited', v)}
         />
-        <window.TweakSection label={tr('tweaksData')} />
-        <window.TweakButton label={tr('tweaksReset')} secondary onClick={() => {
-          if (confirm(tr('confirmReset'))) setRoot(defaultRoot());
-        }} />
-        <window.TweakButton label={tr('tweaksClear')} secondary onClick={() => {
-          if (confirm(tr('confirmClear'))) {
-            patchRoot(prev => ({ ...prev, cities: {}, countries: {} }));
-          }
-        }} />
+        {isAdmin && <>
+          <window.TweakSection label={tr('tweaksData')} />
+          <window.TweakButton label={tr('tweaksReset')} secondary onClick={() => {
+            if (confirm(tr('confirmReset'))) setRoot(defaultRoot());
+          }} />
+          <window.TweakButton label={tr('tweaksClear')} secondary onClick={() => {
+            if (confirm(tr('confirmClear'))) {
+              patchRoot(prev => ({ ...prev, cities: {}, countries: {} }));
+            }
+          }} />
+        </>}
       </window.TweaksPanel>
 
       {sidebarOpen && (
@@ -854,6 +885,7 @@ function App() {
         <AdminPanel
           onClose={() => setShowAdmin(false)}
           currentUserId={authUser?.id}
+          travellers={root.users}
         />
       )}
 
@@ -875,7 +907,7 @@ function countByType(cities) {
 }
 
 // === User Switcher ===
-function UserSwitcher({ tr, users, currentUser, open, onToggle, onClose, onSwitch, onAdd, onRemove, onRename }) {
+function UserSwitcher({ tr, users, currentUser, open, onToggle, onClose, onSwitch, onAdd, onRemove, onRename, authUser, onLinkTraveller }) {
   const [renaming, setRenaming] = useState(null);
   const [newName, setNewName] = useState("");
   const rootRef = useRef(null);
@@ -888,6 +920,7 @@ function UserSwitcher({ tr, users, currentUser, open, onToggle, onClose, onSwitc
 
   if (!currentUser) return null;
   const userList = Object.values(users);
+  const myTravellerIds = authUser?.travellerIds || [];
 
   return (
     <div className="user-switcher" ref={rootRef}>
@@ -901,41 +934,51 @@ function UserSwitcher({ tr, users, currentUser, open, onToggle, onClose, onSwitc
       {open && (
         <div className="user-menu">
           <div className="user-menu-head">{tr('travellers')}</div>
-          {userList.map(u => (
-            <div key={u.id} className={`user-row ${u.id === currentUser.id ? 'is-current' : ''}`}>
-              <span className="user-avatar sm" style={{ background: u.color }}>
-                {u.name.slice(0, 1).toUpperCase()}
-              </span>
-              {renaming === u.id ? (
-                <input
-                  className="user-rename"
-                  value={newName}
-                  autoFocus
-                  onChange={(e) => setNewName(e.target.value)}
-                  onBlur={() => {
-                    if (newName.trim()) onRename(u.id, newName.trim());
-                    setRenaming(null);
-                  }}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') e.target.blur();
-                    if (e.key === 'Escape') { setRenaming(null); }
-                  }}
-                />
-              ) : (
-                <span
-                  className="user-row-name"
-                  onClick={() => onSwitch(u.id)}
-                  onDoubleClick={() => { setRenaming(u.id); setNewName(u.name); }}
-                  title={tr('switchTo') + ' ' + u.name}
-                >{u.name}</span>
-              )}
-              {userList.length > 1 && (
-                <button className="user-row-del" onClick={() => {
-                  if (confirm(tr('confirmRemoveUser', u.name))) onRemove(u.id);
-                }} title={tr('removeTraveller')}>×</button>
-              )}
-            </div>
-          ))}
+          {userList.map(u => {
+            const isLinked = myTravellerIds.includes(u.id);
+            return (
+              <div key={u.id} className={`user-row ${u.id === currentUser.id ? 'is-current' : ''}`}>
+                <span className="user-avatar sm" style={{ background: u.color }}>
+                  {u.name.slice(0, 1).toUpperCase()}
+                </span>
+                {renaming === u.id ? (
+                  <input
+                    className="user-rename"
+                    value={newName}
+                    autoFocus
+                    onChange={(e) => setNewName(e.target.value)}
+                    onBlur={() => {
+                      if (newName.trim()) onRename(u.id, newName.trim());
+                      setRenaming(null);
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') e.target.blur();
+                      if (e.key === 'Escape') { setRenaming(null); }
+                    }}
+                  />
+                ) : (
+                  <span
+                    className="user-row-name"
+                    onClick={() => onSwitch(u.id)}
+                    onDoubleClick={() => { setRenaming(u.id); setNewName(u.name); }}
+                    title={tr('switchTo') + ' ' + u.name}
+                  >{u.name}</span>
+                )}
+                {onLinkTraveller && (
+                  <button
+                    className={`traveller-link-btn ${isLinked ? 'is-linked' : ''}`}
+                    title={isLinked ? 'Unlink my account from this traveller' : 'Link my account to this traveller'}
+                    onClick={(e) => { e.stopPropagation(); onLinkTraveller(u.id, !isLinked); }}
+                  >{isLinked ? '🔗' : '⬜'}</button>
+                )}
+                {userList.length > 1 && (
+                  <button className="user-row-del" onClick={() => {
+                    if (confirm(tr('confirmRemoveUser', u.name))) onRemove(u.id);
+                  }} title={tr('removeTraveller')}>×</button>
+                )}
+              </div>
+            );
+          })}
           <button className="user-add-btn" onClick={() => {
             const name = prompt(tr('travellerName') + ':', '');
             if (name && name.trim()) onAdd(name.trim());
@@ -1523,8 +1566,29 @@ function LoginModal({ onClose, onLogin, error, loading }) {
   );
 }
 
+// === Traveller picker (used in admin panel) ===
+function TravellerPicker({ travellers, selected, onChange }) {
+  const list = Object.values(travellers || {});
+  if (list.length === 0) return <div className="admin-state-msg" style={{padding:'4px 0'}}>No travellers in map yet.</div>;
+  return (
+    <div className="admin-traveller-picker">
+      {list.map(t => (
+        <label key={t.id} className={`admin-traveller-opt ${selected.includes(t.id) ? 'is-checked' : ''}`}>
+          <input
+            type="checkbox"
+            checked={selected.includes(t.id)}
+            onChange={e => onChange(e.target.checked ? [...selected, t.id] : selected.filter(x => x !== t.id))}
+          />
+          <span className="user-avatar sm" style={{ background: t.color }}>{t.name.slice(0,1).toUpperCase()}</span>
+          <span className="admin-traveller-name">{t.name}</span>
+        </label>
+      ))}
+    </div>
+  );
+}
+
 // === Admin panel: user management ===
-function AdminPanel({ onClose, currentUserId }) {
+function AdminPanel({ onClose, currentUserId, travellers }) {
   const [users, setUsers] = useState(null);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
@@ -1532,9 +1596,11 @@ function AdminPanel({ onClose, currentUserId }) {
   const [newUsername, setNewUsername] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [newRole, setNewRole] = useState('user');
+  const [newTravellerIds, setNewTravellerIds] = useState([]);
   const [editingId, setEditingId] = useState(null);
   const [editPassword, setEditPassword] = useState('');
   const [editRole, setEditRole] = useState('');
+  const [editTravellerIds, setEditTravellerIds] = useState([]);
 
   useEffect(() => { loadUsers(); }, []);
 
@@ -1547,29 +1613,36 @@ function AdminPanel({ onClose, currentUserId }) {
   }
 
   function clearMessages() { setError(''); setSuccess(''); }
-  function cancelEdit() { setEditingId(null); setEditPassword(''); setEditRole(''); }
+  function cancelEdit() { setEditingId(null); setEditPassword(''); setEditRole(''); setEditTravellerIds([]); }
+
+  function startEdit(u) {
+    setEditingId(u.id);
+    setEditRole(u.role);
+    setEditPassword('');
+    setEditTravellerIds(u.traveller_ids || []);
+    clearMessages();
+  }
 
   async function createUser() {
     clearMessages();
     const res = await fetch('/api/admin/users', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: newUsername, password: newPassword, role: newRole }),
+      body: JSON.stringify({ username: newUsername, password: newPassword, role: newRole, travellerIds: newTravellerIds }),
     });
     const d = await res.json();
     if (!res.ok) { setError(d.error); return; }
     setCreating(false);
-    setNewUsername(''); setNewPassword(''); setNewRole('user');
+    setNewUsername(''); setNewPassword(''); setNewRole('user'); setNewTravellerIds([]);
     setSuccess(`User "${d.username}" created.`);
     loadUsers();
   }
 
   async function updateUser(id) {
     clearMessages();
-    const body = {};
+    const body = { travellerIds: editTravellerIds };
     if (editPassword) body.password = editPassword;
     if (editRole) body.role = editRole;
-    if (!Object.keys(body).length) { cancelEdit(); return; }
     const res = await fetch(`/api/admin/users/${id}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
@@ -1606,49 +1679,65 @@ function AdminPanel({ onClose, currentUserId }) {
             <div className="admin-state-msg">Loading…</div>
           ) : users.length === 0 ? (
             <div className="admin-state-msg">No users found.</div>
-          ) : users.map(u => (
-            <div key={u.id} className="admin-user-row">
-              <div className="admin-user-info">
-                <span className="user-avatar sm" style={{ background: u.id === currentUserId ? 'var(--accent)' : 'var(--ink-mute)' }}>
-                  {u.username.slice(0, 1).toUpperCase()}
-                </span>
-                <span className="admin-username">{u.username}</span>
-                <span className={`admin-role-badge admin-role-${u.role}`}>{u.role}</span>
-                <span className="admin-created">{new Date(u.created_at).toLocaleDateString()}</span>
-              </div>
-              {editingId === u.id ? (
-                <div className="admin-edit-form">
-                  <input
-                    className="login-input"
-                    type="password"
-                    placeholder="New password (leave blank to keep)"
-                    value={editPassword}
-                    autoFocus
-                    autoComplete="new-password"
-                    onChange={e => setEditPassword(e.target.value)}
-                  />
-                  <div className="admin-role-row">
-                    <label className="admin-role-label">Role:</label>
-                    <select className="admin-role-select" value={editRole} onChange={e => setEditRole(e.target.value)}>
-                      <option value="user">user</option>
-                      <option value="admin">admin</option>
-                    </select>
-                  </div>
-                  <div className="admin-actions-row">
-                    <button className="login-btn admin-save-btn" onClick={() => updateUser(u.id)}>Save</button>
-                    <button className="login-guest" onClick={cancelEdit}>Cancel</button>
-                  </div>
-                </div>
-              ) : (
-                <div className="admin-row-btns">
-                  <button className="admin-edit-btn" onClick={() => { setEditingId(u.id); setEditRole(u.role); setEditPassword(''); clearMessages(); }}>Edit</button>
-                  {u.id !== currentUserId && (
-                    <button className="admin-del-btn" onClick={() => deleteUser(u.id, u.username)}>Delete</button>
+          ) : users.map(u => {
+            const linkedTravellers = (u.traveller_ids || []).map(tid => (travellers || {})[tid]).filter(Boolean);
+            return (
+              <div key={u.id} className="admin-user-row">
+                <div className="admin-user-info">
+                  <span className="user-avatar sm" style={{ background: u.id === currentUserId ? 'var(--accent)' : 'var(--ink-mute)' }}>
+                    {u.username.slice(0, 1).toUpperCase()}
+                  </span>
+                  <span className="admin-username">{u.username}</span>
+                  <span className={`admin-role-badge admin-role-${u.role}`}>{u.role}</span>
+                  {linkedTravellers.length > 0 && (
+                    <span className="admin-linked-travellers">
+                      {linkedTravellers.map(t => (
+                        <span key={t.id} className="user-avatar sm" style={{ background: t.color }} title={t.name}>
+                          {t.name.slice(0, 1).toUpperCase()}
+                        </span>
+                      ))}
+                    </span>
                   )}
+                  <span className="admin-created">{new Date(u.created_at).toLocaleDateString()}</span>
                 </div>
-              )}
-            </div>
-          ))}
+                {editingId === u.id ? (
+                  <div className="admin-edit-form">
+                    <input
+                      className="login-input"
+                      type="password"
+                      placeholder="New password (leave blank to keep)"
+                      value={editPassword}
+                      autoFocus
+                      autoComplete="new-password"
+                      onChange={e => setEditPassword(e.target.value)}
+                    />
+                    <div className="admin-role-row">
+                      <label className="admin-role-label">Role:</label>
+                      <select className="admin-role-select" value={editRole} onChange={e => setEditRole(e.target.value)}>
+                        <option value="user">user</option>
+                        <option value="admin">admin</option>
+                      </select>
+                    </div>
+                    <div className="admin-traveller-section">
+                      <div className="admin-role-label">Linked travellers:</div>
+                      <TravellerPicker travellers={travellers} selected={editTravellerIds} onChange={setEditTravellerIds} />
+                    </div>
+                    <div className="admin-actions-row">
+                      <button className="login-btn admin-save-btn" onClick={() => updateUser(u.id)}>Save</button>
+                      <button className="login-guest" onClick={cancelEdit}>Cancel</button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="admin-row-btns">
+                    <button className="admin-edit-btn" onClick={() => startEdit(u)}>Edit</button>
+                    {u.id !== currentUserId && (
+                      <button className="admin-del-btn" onClick={() => deleteUser(u.id, u.username)}>Delete</button>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })}
         </div>
 
         <div className="admin-footer">
@@ -1682,13 +1771,17 @@ function AdminPanel({ onClose, currentUserId }) {
                   <option value="admin">admin</option>
                 </select>
               </div>
+              <div className="admin-traveller-section">
+                <div className="admin-role-label">Linked travellers:</div>
+                <TravellerPicker travellers={travellers} selected={newTravellerIds} onChange={setNewTravellerIds} />
+              </div>
               <div className="admin-actions-row">
                 <button
                   className="login-btn admin-save-btn"
                   onClick={createUser}
                   disabled={newUsername.trim().length < 2 || newPassword.length < 8}
                 >Create user</button>
-                <button className="login-guest" onClick={() => { setCreating(false); setNewUsername(''); setNewPassword(''); setNewRole('user'); }}>Cancel</button>
+                <button className="login-guest" onClick={() => { setCreating(false); setNewUsername(''); setNewPassword(''); setNewRole('user'); setNewTravellerIds([]); }}>Cancel</button>
               </div>
             </div>
           )}
