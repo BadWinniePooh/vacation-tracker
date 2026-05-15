@@ -7,6 +7,15 @@ const bcrypt = require('bcryptjs');
 const { Pool } = require('pg');
 const path = require('path');
 
+// Fail fast with a clear message if required environment variables are absent.
+const REQUIRED_ENV = ['DATABASE_URL', 'SESSION_SECRET', 'APP_PASSWORD_HASH'];
+const missing = REQUIRED_ENV.filter(k => !process.env[k]);
+if (missing.length) {
+  console.error(`Missing required environment variables: ${missing.join(', ')}`);
+  console.error('Copy .env.example to .env, fill in the values, and restart.');
+  process.exit(1);
+}
+
 function mergeStates(base, incoming) {
   const users = { ...base.users };
   for (const [id, u] of Object.entries(incoming.users || {})) {
