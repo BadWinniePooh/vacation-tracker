@@ -16,6 +16,19 @@ if (missing.length) {
   process.exit(1);
 }
 
+// Detect bcrypt hashes mangled by Docker Compose $ interpolation.
+// Docker Compose expands $VAR in .env values unless they are single-quoted.
+// A bcrypt hash always starts with $2b$ or $2a$; anything else means the
+// value was silently truncated/mangled and bcrypt.compare() will always fail.
+if (!process.env.APP_PASSWORD_HASH.startsWith('$2')) {
+  console.error('APP_PASSWORD_HASH does not look like a valid bcrypt hash (expected to start with $2b$).');
+  console.error('Docker Compose interpolates $ in .env values, silently mangling the hash.');
+  console.error("Wrap the value in single quotes in your .env file:");
+  console.error("  APP_PASSWORD_HASH='$2b$12$...'");
+  console.error("Run 'npm run gen-hash -- yourpassword' to regenerate in the correct format.");
+  process.exit(1);
+}
+
 function mergeStates(base, incoming) {
   const users = { ...base.users };
   for (const [id, u] of Object.entries(incoming.users || {})) {

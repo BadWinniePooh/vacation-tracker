@@ -8,4 +8,5 @@ if (!password) {
   console.error('Usage: node scripts/gen-password-hash.js <your-password>');
   process.exit(1);
 }
-console.log(bcrypt.hashSync(password, 12));
+// Single quotes prevent Docker Compose from interpolating $ in the bcrypt hash.
+console.log(`APP_PASSWORD_HASH='${bcrypt.hashSync(password, 12)}'`);
