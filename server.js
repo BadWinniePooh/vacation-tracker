@@ -81,6 +81,12 @@ function sanitiseClientId(raw) {
   return raw.replace(/[^a-zA-Z0-9\-]/g, '').slice(0, 64);
 }
 
+// Restrict to alphanumeric + hyphens + underscores, 2–32 chars
+function sanitiseUsername(raw) {
+  if (typeof raw !== 'string') return '';
+  return raw.replace(/[^a-zA-Z0-9_\-]/g, '').slice(0, 32);
+}
+
 const app = express();
 
 // --- Security headers (OWASP A05) ---
@@ -176,8 +182,13 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 // --- Auth middleware ---
 function requireAuth(req, res, next) {
-  if (req.session && req.session.authenticated) return next();
+  if (req.session && req.session.userId) return next();
   res.status(401).json({ error: 'Authentication required' });
+}
+
+function requireAdmin(req, res, next) {
+  if (req.session && req.session.role === 'admin') return next();
+  res.status(403).json({ error: 'Admin access required' });
 }
 
 // --- SSE clients ---
@@ -202,27 +213,50 @@ app.get('/api/events', (req, res) => {
 
 // --- Auth endpoints ---
 app.get('/api/auth/status', (req, res) => {
-  res.json({ authenticated: !!(req.session && req.session.authenticated) });
+  if (req.session && req.session.userId) {
+    res.json({
+      authenticated: true,
+      id: req.session.userId,
+      username: req.session.username,
+      role: req.session.role,
+    });
+  } else {
+    res.json({ authenticated: false });
+  }
 });
 
 app.post('/api/auth/login', authLimiter, async (req, res) => {
-  const { password } = req.body || {};
+  const { username, password } = req.body || {};
+  if (!username || typeof username !== 'string') {
+    return res.status(400).json({ error: 'Username required' });
+  }
   if (!password || typeof password !== 'string') {
     return res.status(400).json({ error: 'Password required' });
   }
-  const hash = process.env.APP_PASSWORD_HASH;
-  if (!hash) {
-    return res.status(503).json({ error: 'Authentication not configured on this server' });
+  try {
+    const result = await pool.query(
+      'SELECT id, username, password_hash, role FROM app_users WHERE username = $1',
+      [sanitiseUsername(username)]
+    );
+    const user = result.rows[0];
+    if (!user) {
+      return res.status(401).json({ error: 'Invalid username or password' });
+    }
+    const ok = await bcrypt.compare(password, user.password_hash);
+    if (!ok) {
+      return res.status(401).json({ error: 'Invalid username or password' });
+    }
+    req.session.userId = user.id;
+    req.session.username = user.username;
+    req.session.role = user.role;
+    req.session.save(err => {
+      if (err) return res.status(500).json({ error: 'Session error' });
+      res.json({ ok: true, id: user.id, username: user.username, role: user.role });
+    });
+  } catch (e) {
+    console.error('POST /api/auth/login:', e.message);
+    res.status(500).json({ error: 'Database error' });
   }
-  const ok = await bcrypt.compare(password, hash);
-  if (!ok) {
-    return res.status(401).json({ error: 'Incorrect password' });
-  }
-  req.session.authenticated = true;
-  req.session.save(err => {
-    if (err) return res.status(500).json({ error: 'Session error' });
-    res.json({ ok: true });
-  });
 });
 
 app.post('/api/auth/logout', (req, res) => {
@@ -230,6 +264,141 @@ app.post('/api/auth/logout', (req, res) => {
     res.clearCookie('connect.sid');
     res.json({ ok: true });
   });
+});
+
+// Change own password (any authenticated user)
+app.put('/api/auth/password', requireAuth, writeLimiter, async (req, res) => {
+  const { currentPassword, newPassword } = req.body || {};
+  if (!currentPassword || typeof currentPassword !== 'string') {
+    return res.status(400).json({ error: 'Current password required' });
+  }
+  if (!newPassword || typeof newPassword !== 'string' || newPassword.length < 8) {
+    return res.status(400).json({ error: 'New password must be at least 8 characters' });
+  }
+  try {
+    const result = await pool.query(
+      'SELECT password_hash FROM app_users WHERE id = $1',
+      [req.session.userId]
+    );
+    if (!result.rows.length) return res.status(404).json({ error: 'User not found' });
+    const ok = await bcrypt.compare(currentPassword, result.rows[0].password_hash);
+    if (!ok) return res.status(401).json({ error: 'Current password is incorrect' });
+    const hash = await bcrypt.hash(newPassword, 12);
+    await pool.query('UPDATE app_users SET password_hash = $1 WHERE id = $2', [hash, req.session.userId]);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('PUT /api/auth/password:', e.message);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+// --- Admin: user management ---
+app.get('/api/admin/users', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT id, username, role, created_at FROM app_users ORDER BY created_at'
+    );
+    res.json(result.rows);
+  } catch (e) {
+    console.error('GET /api/admin/users:', e.message);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+app.post('/api/admin/users', requireAuth, requireAdmin, writeLimiter, async (req, res) => {
+  const { username, password, role = 'user' } = req.body || {};
+  const clean = sanitiseUsername(username || '');
+  if (clean.length < 2) {
+    return res.status(400).json({ error: 'Username must be 2–32 alphanumeric characters' });
+  }
+  if (!password || typeof password !== 'string' || password.length < 8) {
+    return res.status(400).json({ error: 'Password must be at least 8 characters' });
+  }
+  if (!['admin', 'user'].includes(role)) {
+    return res.status(400).json({ error: 'Role must be admin or user' });
+  }
+  try {
+    const hash = await bcrypt.hash(password, 12);
+    const result = await pool.query(
+      'INSERT INTO app_users (username, password_hash, role) VALUES ($1, $2, $3) RETURNING id, username, role, created_at',
+      [clean, hash, role]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ error: 'Username already exists' });
+    console.error('POST /api/admin/users:', e.message);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+app.put('/api/admin/users/:id', requireAuth, requireAdmin, writeLimiter, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id) || id <= 0) {
+    return res.status(400).json({ error: 'Invalid user ID' });
+  }
+  const { password, role } = req.body || {};
+  try {
+    const existing = await pool.query('SELECT id, role FROM app_users WHERE id = $1', [id]);
+    if (!existing.rows.length) return res.status(404).json({ error: 'User not found' });
+
+    if (password !== undefined) {
+      if (typeof password !== 'string' || password.length < 8) {
+        return res.status(400).json({ error: 'Password must be at least 8 characters' });
+      }
+      const hash = await bcrypt.hash(password, 12);
+      await pool.query('UPDATE app_users SET password_hash = $1 WHERE id = $2', [hash, id]);
+    }
+
+    if (role !== undefined) {
+      if (!['admin', 'user'].includes(role)) {
+        return res.status(400).json({ error: 'Role must be admin or user' });
+      }
+      // Prevent demoting the last admin
+      if (role !== 'admin' && existing.rows[0].role === 'admin') {
+        const cnt = await pool.query("SELECT COUNT(*) FROM app_users WHERE role = 'admin'");
+        if (parseInt(cnt.rows[0].count, 10) <= 1) {
+          return res.status(400).json({ error: 'Cannot demote the last admin' });
+        }
+      }
+      await pool.query('UPDATE app_users SET role = $1 WHERE id = $2', [role, id]);
+    }
+
+    const result = await pool.query(
+      'SELECT id, username, role, created_at FROM app_users WHERE id = $1',
+      [id]
+    );
+    res.json(result.rows[0]);
+  } catch (e) {
+    console.error('PUT /api/admin/users/:id:', e.message);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+app.delete('/api/admin/users/:id', requireAuth, requireAdmin, writeLimiter, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isInteger(id) || id <= 0) {
+    return res.status(400).json({ error: 'Invalid user ID' });
+  }
+  if (id === req.session.userId) {
+    return res.status(400).json({ error: 'Cannot delete your own account' });
+  }
+  try {
+    const user = await pool.query('SELECT role FROM app_users WHERE id = $1', [id]);
+    if (!user.rows.length) return res.status(404).json({ error: 'User not found' });
+
+    if (user.rows[0].role === 'admin') {
+      const cnt = await pool.query("SELECT COUNT(*) FROM app_users WHERE role = 'admin'");
+      if (parseInt(cnt.rows[0].count, 10) <= 1) {
+        return res.status(400).json({ error: 'Cannot delete the last admin' });
+      }
+    }
+
+    await pool.query('DELETE FROM app_users WHERE id = $1', [id]);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('DELETE /api/admin/users/:id:', e.message);
+    res.status(500).json({ error: 'Database error' });
+  }
 });
 
 // --- App state ---
@@ -241,13 +410,38 @@ async function initDB() {
       updated_at TIMESTAMPTZ DEFAULT NOW()
     )
   `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS app_users (
+      id SERIAL PRIMARY KEY,
+      username TEXT UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL,
+      role TEXT NOT NULL DEFAULT 'user' CHECK (role IN ('admin', 'user')),
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+
+  // Seed the admin user from env vars on first run (no admin in DB yet).
+  // APP_ADMIN_USERNAME defaults to 'admin'. Going forward, manage users via
+  // the in-app admin panel — APP_PASSWORD_HASH is only used for this seed.
+  const adminExists = await pool.query("SELECT id FROM app_users WHERE role = 'admin' LIMIT 1");
+  if (adminExists.rows.length === 0) {
+    const adminUsername = sanitiseUsername(process.env.APP_ADMIN_USERNAME || 'admin');
+    await pool.query(
+      `INSERT INTO app_users (username, password_hash, role)
+       VALUES ($1, $2, 'admin')
+       ON CONFLICT (username) DO UPDATE SET role = 'admin', password_hash = EXCLUDED.password_hash`,
+      [adminUsername, process.env.APP_PASSWORD_HASH]
+    );
+    console.log(`Admin user '${adminUsername}' created from APP_PASSWORD_HASH.`);
+  }
 }
 
 app.get('/api/state', async (req, res) => {
   try {
     const result = await pool.query("SELECT data FROM app_state WHERE id = 'default'");
     const state = result.rows.length > 0 ? result.rows[0].data : null;
-    const isAuth = !!(req.session && req.session.authenticated);
+    const isAuth = !!(req.session && req.session.userId);
     res.json(isAuth ? state : redactForGuest(state));
   } catch (e) {
     console.error('GET /api/state:', e.message);

@@ -1322,3 +1322,187 @@ input, textarea, select { font-family: inherit; color: inherit; }
   white-space: pre-wrap;
 }
 .field-empty { color: var(--ink-mute); }
+
+/* === Topbar: signed-in username + icon buttons === */
+.topbar-user-label {
+  font-size: 12px;
+  color: var(--ink-soft);
+  max-width: 90px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+@media (max-width: 600px) { .topbar-user-label { display: none; } }
+
+.topbar-icon-btn {
+  background: none;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: 0 8px;
+  height: 30px;
+  font-size: 14px;
+  cursor: pointer;
+  color: var(--ink-soft);
+  transition: border-color 0.15s, color 0.15s;
+  line-height: 1;
+}
+.topbar-icon-btn:hover { border-color: var(--ink-soft); color: var(--ink); }
+
+/* === Admin panel === */
+.admin-modal {
+  background: var(--bg-card);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  padding: 32px 28px 24px;
+  width: min(520px, calc(100vw - 32px));
+  max-height: 80dvh;
+  overflow-y: auto;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.admin-user-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.admin-user-row {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  padding: 10px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.admin-user-info {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.admin-username {
+  font-weight: 600;
+  flex: 1;
+  font-size: 14px;
+}
+
+.admin-created {
+  font-size: 11px;
+  color: var(--ink-mute);
+}
+
+.admin-role-badge {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 2px 8px;
+  border-radius: 20px;
+}
+.admin-role-admin {
+  background: oklch(55% 0.16 220 / 14%);
+  color: oklch(38% 0.16 220);
+}
+.admin-role-user {
+  background: oklch(55% 0.08 70 / 14%);
+  color: oklch(40% 0.08 70);
+}
+
+.admin-row-btns {
+  display: flex;
+  gap: 6px;
+}
+.admin-edit-btn, .admin-del-btn {
+  padding: 3px 10px;
+  font-size: 12px;
+  border-radius: 5px;
+  cursor: pointer;
+  font-family: var(--font-sans);
+}
+.admin-edit-btn {
+  border: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--ink-soft);
+}
+.admin-edit-btn:hover { border-color: var(--ink-mute); color: var(--ink); }
+.admin-del-btn {
+  border: 1px solid oklch(55% 0.18 25 / 35%);
+  background: oklch(55% 0.18 25 / 8%);
+  color: oklch(42% 0.18 25);
+}
+.admin-del-btn:hover { background: oklch(55% 0.18 25 / 16%); }
+
+.admin-edit-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.admin-role-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.admin-role-label {
+  font-size: 13px;
+  color: var(--ink-soft);
+  white-space: nowrap;
+}
+.admin-role-select {
+  padding: 5px 10px;
+  border: 1.5px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  color: var(--ink);
+  font-size: 13px;
+  font-family: var(--font-sans);
+  cursor: pointer;
+}
+.admin-role-select:focus { outline: none; border-color: var(--accent); }
+
+.admin-actions-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.admin-save-btn {
+  flex: none;
+  padding: 8px 18px;
+}
+
+.admin-footer {
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+}
+
+.admin-create-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.admin-create-title {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--ink-mute);
+}
+
+.admin-state-msg {
+  text-align: center;
+  color: var(--ink-soft);
+  font-size: 13px;
+  padding: 16px 0;
+}
+
+.admin-success {
+  font-size: 13px;
+  color: oklch(40% 0.15 145);
+  background: oklch(40% 0.15 145 / 10%);
+  border-radius: var(--radius-sm);
+  padding: 7px 11px;
+}

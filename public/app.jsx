@@ -285,10 +285,14 @@ function App() {
   const clientIdRef = useRef(Math.random().toString(36).slice(2, 10));
 
   const [authStatus, setAuthStatus] = useState('loading');
+  const [authUser, setAuthUser] = useState(null); // { id, username, role } | null
   const [showLogin, setShowLogin] = useState(false);
+  const [showAdmin, setShowAdmin] = useState(false);
+  const [showChangePwd, setShowChangePwd] = useState(false);
   const [loginError, setLoginError] = useState('');
   const [loginLoading, setLoginLoading] = useState(false);
   const isAuth = authStatus === 'authenticated';
+  const isAdmin = isAuth && authUser?.role === 'admin';
 
   function refreshState() {
     return fetch('/api/state')
@@ -309,6 +313,9 @@ function App() {
       fetch('/api/state').then(r => r.ok ? r.json() : null).catch(() => null),
     ]).then(([authData, stateData]) => {
       setAuthStatus(authData.authenticated ? 'authenticated' : 'unauthenticated');
+      if (authData.authenticated) {
+        setAuthUser({ id: authData.id, username: authData.username, role: authData.role });
+      }
       if (isValidState(stateData)) {
         setRoot({ ...stateData, currentUser: loadCurrentUser(stateData) });
       } else {
@@ -317,22 +324,23 @@ function App() {
     });
   }, []);
 
-  async function handleLogin(password) {
+  async function handleLogin(username, password) {
     setLoginLoading(true);
     setLoginError('');
     try {
       const res = await fetch('/api/auth/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ password }),
+        body: JSON.stringify({ username, password }),
       });
       const d = await res.json();
       if (res.ok) {
         setAuthStatus('authenticated');
+        setAuthUser({ id: d.id, username: d.username, role: d.role });
         setShowLogin(false);
         await refreshState();
       } else {
-        setLoginError(d.error || 'Incorrect password');
+        setLoginError(d.error || 'Invalid username or password');
       }
     } catch (e) {
       setLoginError('Connection error');
@@ -343,6 +351,7 @@ function App() {
   async function handleLogout() {
     await fetch('/api/auth/logout', { method: 'POST' }).catch(() => {});
     setAuthStatus('unauthenticated');
+    setAuthUser(null);
     await refreshState();
   }
 
@@ -646,6 +655,25 @@ function App() {
           ) : (
             <button className="auth-btn" onClick={() => setShowLogin(true)}>Sign in</button>
           )}
+          {isAuth && authUser && (
+            <span className="topbar-user-label" title={`Signed in as ${authUser.username}`}>
+              {authUser.username}
+            </span>
+          )}
+          {isAdmin && (
+            <button
+              className="topbar-icon-btn"
+              title="User management"
+              onClick={() => setShowAdmin(true)}
+            >👥</button>
+          )}
+          {isAuth && (
+            <button
+              className="topbar-icon-btn"
+              title="Change password"
+              onClick={() => setShowChangePwd(true)}
+            >🔑</button>
+          )}
           <button
             className={`mob-sidebar-btn${sidebarOpen ? ' is-open' : ''}`}
             aria-label="Toggle city list"
@@ -820,6 +848,17 @@ function App() {
           error={loginError}
           loading={loginLoading}
         />
+      )}
+
+      {showAdmin && (
+        <AdminPanel
+          onClose={() => setShowAdmin(false)}
+          currentUserId={authUser?.id}
+        />
+      )}
+
+      {showChangePwd && (
+        <ChangePasswordModal onClose={() => setShowChangePwd(false)} />
       )}
     </div>
   );
@@ -1439,29 +1478,289 @@ function DetailPanel({ tr, city, users, currentUserId, types, customTypes, isAut
 
 // === Login modal ===
 function LoginModal({ onClose, onLogin, error, loading }) {
+  const [username, setUsername] = useState('');
   const [pw, setPw] = useState('');
-  function submit() { if (pw.trim()) onLogin(pw); }
+  const pwRef = useRef(null);
+  function submit() { if (username.trim() && pw) onLogin(username.trim(), pw); }
   return (
     <div className="login-overlay" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
       <div className="login-modal">
         <button className="login-close" onClick={onClose}>×</button>
         <div className="login-title">Sign in to edit</div>
-        <div className="login-sub">Enter the access password to add or change places.</div>
+        <div className="login-sub">Enter your credentials to add or change places.</div>
         <input
+          className="login-input"
+          type="text"
+          placeholder="Username"
+          value={username}
+          autoFocus
+          autoComplete="username"
+          onChange={e => setUsername(e.target.value)}
+          onKeyDown={e => {
+            if (e.key === 'Enter' && username.trim()) pwRef.current?.focus();
+            if (e.key === 'Escape') onClose();
+          }}
+        />
+        <input
+          ref={pwRef}
           className="login-input"
           type="password"
           placeholder="Password"
           value={pw}
-          autoFocus
+          autoComplete="current-password"
           onChange={e => setPw(e.target.value)}
           onKeyDown={e => { if (e.key === 'Enter') submit(); if (e.key === 'Escape') onClose(); }}
         />
         {error && <div className="login-error">{error}</div>}
         <div className="login-actions">
-          <button className="login-btn" onClick={submit} disabled={loading || !pw.trim()}>
+          <button className="login-btn" onClick={submit} disabled={loading || !username.trim() || !pw}>
             {loading ? 'Signing in…' : 'Sign in'}
           </button>
           <button className="login-guest" onClick={onClose}>Continue as guest</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// === Admin panel: user management ===
+function AdminPanel({ onClose, currentUserId }) {
+  const [users, setUsers] = useState(null);
+  const [error, setError] = useState('');
+  const [success, setSuccess] = useState('');
+  const [creating, setCreating] = useState(false);
+  const [newUsername, setNewUsername] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [newRole, setNewRole] = useState('user');
+  const [editingId, setEditingId] = useState(null);
+  const [editPassword, setEditPassword] = useState('');
+  const [editRole, setEditRole] = useState('');
+
+  useEffect(() => { loadUsers(); }, []);
+
+  async function loadUsers() {
+    try {
+      const res = await fetch('/api/admin/users');
+      if (!res.ok) { setError('Failed to load users'); return; }
+      setUsers(await res.json());
+    } catch (e) { setError('Connection error'); }
+  }
+
+  function clearMessages() { setError(''); setSuccess(''); }
+  function cancelEdit() { setEditingId(null); setEditPassword(''); setEditRole(''); }
+
+  async function createUser() {
+    clearMessages();
+    const res = await fetch('/api/admin/users', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: newUsername, password: newPassword, role: newRole }),
+    });
+    const d = await res.json();
+    if (!res.ok) { setError(d.error); return; }
+    setCreating(false);
+    setNewUsername(''); setNewPassword(''); setNewRole('user');
+    setSuccess(`User "${d.username}" created.`);
+    loadUsers();
+  }
+
+  async function updateUser(id) {
+    clearMessages();
+    const body = {};
+    if (editPassword) body.password = editPassword;
+    if (editRole) body.role = editRole;
+    if (!Object.keys(body).length) { cancelEdit(); return; }
+    const res = await fetch(`/api/admin/users/${id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const d = await res.json();
+    if (!res.ok) { setError(d.error); return; }
+    cancelEdit();
+    setSuccess('User updated.');
+    loadUsers();
+  }
+
+  async function deleteUser(id, username) {
+    if (!confirm(`Delete user "${username}"? This cannot be undone.`)) return;
+    clearMessages();
+    const res = await fetch(`/api/admin/users/${id}`, { method: 'DELETE' });
+    const d = await res.json();
+    if (!res.ok) { setError(d.error); return; }
+    setSuccess(`User "${username}" deleted.`);
+    loadUsers();
+  }
+
+  return (
+    <div className="login-overlay" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+      <div className="admin-modal">
+        <button className="login-close" onClick={onClose}>×</button>
+        <div className="login-title">User Management</div>
+
+        {error && <div className="login-error">{error}</div>}
+        {success && <div className="admin-success">{success}</div>}
+
+        <div className="admin-user-list">
+          {users === null ? (
+            <div className="admin-state-msg">Loading…</div>
+          ) : users.length === 0 ? (
+            <div className="admin-state-msg">No users found.</div>
+          ) : users.map(u => (
+            <div key={u.id} className="admin-user-row">
+              <div className="admin-user-info">
+                <span className="user-avatar sm" style={{ background: u.id === currentUserId ? 'var(--accent)' : 'var(--ink-mute)' }}>
+                  {u.username.slice(0, 1).toUpperCase()}
+                </span>
+                <span className="admin-username">{u.username}</span>
+                <span className={`admin-role-badge admin-role-${u.role}`}>{u.role}</span>
+                <span className="admin-created">{new Date(u.created_at).toLocaleDateString()}</span>
+              </div>
+              {editingId === u.id ? (
+                <div className="admin-edit-form">
+                  <input
+                    className="login-input"
+                    type="password"
+                    placeholder="New password (leave blank to keep)"
+                    value={editPassword}
+                    autoFocus
+                    autoComplete="new-password"
+                    onChange={e => setEditPassword(e.target.value)}
+                  />
+                  <div className="admin-role-row">
+                    <label className="admin-role-label">Role:</label>
+                    <select className="admin-role-select" value={editRole} onChange={e => setEditRole(e.target.value)}>
+                      <option value="user">user</option>
+                      <option value="admin">admin</option>
+                    </select>
+                  </div>
+                  <div className="admin-actions-row">
+                    <button className="login-btn admin-save-btn" onClick={() => updateUser(u.id)}>Save</button>
+                    <button className="login-guest" onClick={cancelEdit}>Cancel</button>
+                  </div>
+                </div>
+              ) : (
+                <div className="admin-row-btns">
+                  <button className="admin-edit-btn" onClick={() => { setEditingId(u.id); setEditRole(u.role); setEditPassword(''); clearMessages(); }}>Edit</button>
+                  {u.id !== currentUserId && (
+                    <button className="admin-del-btn" onClick={() => deleteUser(u.id, u.username)}>Delete</button>
+                  )}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+
+        <div className="admin-footer">
+          {!creating ? (
+            <button className="ctype-add-btn" onClick={() => { setCreating(true); clearMessages(); }}>+ Add user</button>
+          ) : (
+            <div className="admin-create-form">
+              <div className="admin-create-title">New user</div>
+              <input
+                className="login-input"
+                type="text"
+                placeholder="Username (2–32 chars)"
+                value={newUsername}
+                autoFocus
+                autoComplete="username"
+                onChange={e => setNewUsername(e.target.value)}
+              />
+              <input
+                className="login-input"
+                type="password"
+                placeholder="Password (min 8 chars)"
+                value={newPassword}
+                autoComplete="new-password"
+                onChange={e => setNewPassword(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter' && newUsername.trim().length >= 2 && newPassword.length >= 8) createUser(); }}
+              />
+              <div className="admin-role-row">
+                <label className="admin-role-label">Role:</label>
+                <select className="admin-role-select" value={newRole} onChange={e => setNewRole(e.target.value)}>
+                  <option value="user">user</option>
+                  <option value="admin">admin</option>
+                </select>
+              </div>
+              <div className="admin-actions-row">
+                <button
+                  className="login-btn admin-save-btn"
+                  onClick={createUser}
+                  disabled={newUsername.trim().length < 2 || newPassword.length < 8}
+                >Create user</button>
+                <button className="login-guest" onClick={() => { setCreating(false); setNewUsername(''); setNewPassword(''); setNewRole('user'); }}>Cancel</button>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// === Change password modal (all authenticated users) ===
+function ChangePasswordModal({ onClose }) {
+  const [currentPw, setCurrentPw] = useState('');
+  const [newPw, setNewPw] = useState('');
+  const [error, setError] = useState('');
+  const [success, setSuccess] = useState('');
+  const [loading, setLoading] = useState(false);
+  const newPwRef = useRef(null);
+
+  async function submit() {
+    if (!currentPw || !newPw) return;
+    if (newPw.length < 8) { setError('New password must be at least 8 characters'); return; }
+    setLoading(true);
+    setError('');
+    try {
+      const res = await fetch('/api/auth/password', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ currentPassword: currentPw, newPassword: newPw }),
+      });
+      const d = await res.json();
+      if (res.ok) {
+        setSuccess('Password changed successfully.');
+        setCurrentPw(''); setNewPw('');
+      } else {
+        setError(d.error || 'Failed to change password');
+      }
+    } catch (e) { setError('Connection error'); }
+    setLoading(false);
+  }
+
+  return (
+    <div className="login-overlay" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+      <div className="login-modal">
+        <button className="login-close" onClick={onClose}>×</button>
+        <div className="login-title">Change Password</div>
+        <input
+          className="login-input"
+          type="password"
+          placeholder="Current password"
+          value={currentPw}
+          autoFocus
+          autoComplete="current-password"
+          onChange={e => setCurrentPw(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Enter' && currentPw) newPwRef.current?.focus(); if (e.key === 'Escape') onClose(); }}
+        />
+        <input
+          ref={newPwRef}
+          className="login-input"
+          type="password"
+          placeholder="New password (min 8 chars)"
+          value={newPw}
+          autoComplete="new-password"
+          onChange={e => setNewPw(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Enter') submit(); if (e.key === 'Escape') onClose(); }}
+        />
+        {error && <div className="login-error">{error}</div>}
+        {success && <div className="admin-success">{success}</div>}
+        <div className="login-actions">
+          <button className="login-btn" onClick={submit} disabled={loading || !currentPw || !newPw}>
+            {loading ? 'Saving…' : 'Change password'}
+          </button>
+          <button className="login-guest" onClick={onClose}>Cancel</button>
         </div>
       </div>
     </div>
