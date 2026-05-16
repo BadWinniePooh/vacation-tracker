@@ -1,0 +1,72 @@
+name: Docker Build & Security Scan
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-scan:
+    name: Build image and scan for vulnerabilities
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write   # required to upload SARIF results to GitHub Security
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: vacation-tracker:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify container runs as non-root
+        run: |
+          USER_ID=$(docker run --rm --entrypoint id vacation-tracker:ci -u)
+          echo "Container UID: $USER_ID"
+          if [ "$USER_ID" = "0" ]; then
+            echo "ERROR: container is running as root (UID 0)"
+            exit 1
+          fi
+          echo "OK: container runs as non-root (UID $USER_ID)"
+
+      # Table format: human-readable CVE list visible in the job log.
+      # This step gates the build — it fails on CRITICAL/HIGH fixable CVEs.
+      - name: Scan image with Trivy — table output (build gate)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: vacation-tracker:ci
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: true
+
+      # SARIF format: machine-readable report uploaded to the GitHub Security tab.
+      # Runs even when the table step above fails so the report is always available.
+      - name: Scan image with Trivy — SARIF output (Security tab)
+        if: always()
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: vacation-tracker:ci
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          exit-code: "0"         # do not double-fail; gating is done above
+          ignore-unfixed: true
+
+      - name: Upload Trivy SARIF to GitHub Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif

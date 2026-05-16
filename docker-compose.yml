@@ -2,29 +2,34 @@ services:
   db:
     image: postgres:16-alpine
     environment:
-      POSTGRES_DB: vacation_tracker
-      POSTGRES_USER: atlas
-      POSTGRES_PASSWORD: atlas_pass
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:
       - pgdata:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
+    # Port intentionally not exposed to host — app connects via internal network only
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U atlas -d vacation_tracker"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 5s
       timeout: 5s
       retries: 10
+    restart: unless-stopped
 
   app:
     build: .
     ports:
-      - "3000:3000"
+      # Set APP_PORT in .env to use a different port (default: 3000).
+      # Binds to all interfaces so the app is reachable on the local network.
+      - "${APP_PORT:-3000}:3000"
     environment:
-      DATABASE_URL: postgres://atlas:atlas_pass@db:5432/vacation_tracker
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
       PORT: 3000
+      SESSION_SECRET: ${SESSION_SECRET}
+      APP_PASSWORD_HASH: ${APP_PASSWORD_HASH}
     depends_on:
       db:
         condition: service_healthy
+    restart: unless-stopped
 
 volumes:
   pgdata:

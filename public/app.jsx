@@ -29,8 +29,8 @@ const CUSTOM_TYPE_GLYPHS = ["✦","◉","✺","❀","♨","☀","♪","☂","⚑
 
 function uid() { return Math.random().toString(36).slice(2, 9); }
 
-function makeUser(name, color) {
-  return { id: uid(), name, color, _ts: Date.now() };
+function makeUser(name, color, ownerId) {
+  return { id: uid(), name, color, _ts: Date.now(), ...(ownerId != null ? { ownerId } : {}) };
 }
 
 function isValidState(data) {
@@ -283,21 +283,80 @@ function App() {
   const saveTimerRef = useRef(null);
   const settingsAppliedRef = useRef(false);
   const clientIdRef = useRef(Math.random().toString(36).slice(2, 10));
+  const didAutoSwitchRef = useRef(false);
 
-  // Load state from API on mount; fall back to localStorage if server unreachable.
-  // currentUser is device-local: injected from localStorage, never from DB.
-  useEffect(() => {
-    fetch('/api/state')
+  const [authStatus, setAuthStatus] = useState('loading');
+  const [authUser, setAuthUser] = useState(null); // { id, username, role } | null
+  const [showLogin, setShowLogin] = useState(false);
+  const [showAdmin, setShowAdmin] = useState(false);
+  const [showChangePwd, setShowChangePwd] = useState(false);
+  const [loginError, setLoginError] = useState('');
+  const [loginLoading, setLoginLoading] = useState(false);
+  const isAuth = authStatus === 'authenticated';
+  const isAdmin = isAuth && authUser?.role === 'admin';
+
+  function refreshState() {
+    return fetch('/api/state')
       .then(r => r.ok ? r.json() : null)
       .then(data => {
         if (isValidState(data)) {
-          setRoot({ ...data, currentUser: loadCurrentUser(data) });
-        } else {
-          setRoot(loadLocalOrDefault());
+          setRoot(prev => ({ ...data, currentUser: (prev && prev.currentUser) || loadCurrentUser(data) }));
         }
       })
-      .catch(() => setRoot(loadLocalOrDefault()));
+      .catch(() => {});
+  }
+
+  // Load auth status and state in parallel on mount.
+  // currentUser is device-local: injected from localStorage, never from DB.
+  useEffect(() => {
+    Promise.all([
+      fetch('/api/auth/status').then(r => r.json()).catch(() => ({ authenticated: false })),
+      fetch('/api/state').then(r => r.ok ? r.json() : null).catch(() => null),
+    ]).then(([authData, stateData]) => {
+      setAuthStatus(authData.authenticated ? 'authenticated' : 'unauthenticated');
+      if (authData.authenticated) {
+        setAuthUser({ id: authData.id, username: authData.username, role: authData.role, travellerIds: authData.travellerIds || [] });
+      }
+      if (isValidState(stateData)) {
+        setRoot({ ...stateData, currentUser: loadCurrentUser(stateData) });
+      } else {
+        setRoot(loadLocalOrDefault());
+      }
+    });
   }, []);
+
+  async function handleLogin(username, password) {
+    setLoginLoading(true);
+    setLoginError('');
+    try {
+      const res = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password }),
+      });
+      const d = await res.json();
+      if (res.ok) {
+        didAutoSwitchRef.current = false;
+        setAuthStatus('authenticated');
+        setAuthUser({ id: d.id, username: d.username, role: d.role, travellerIds: d.travellerIds || [] });
+        setShowLogin(false);
+        await refreshState();
+      } else {
+        setLoginError(d.error || 'Invalid username or password');
+      }
+    } catch (e) {
+      setLoginError('Connection error');
+    }
+    setLoginLoading(false);
+  }
+
+  async function handleLogout() {
+    await fetch('/api/auth/logout', { method: 'POST' }).catch(() => {});
+    didAutoSwitchRef.current = false;
+    setAuthStatus('unauthenticated');
+    setAuthUser(null);
+    await refreshState();
+  }
 
   // Persist currentUser to localStorage (device-local, never sent to DB)
   useEffect(() => {
@@ -346,12 +405,33 @@ function App() {
     return () => es.close();
   }, []);
 
+  // Auto-switch to the user's linked traveller once per login session.
+  // Inline setRoot rather than calling switchUser (which is defined after the early return).
+  useEffect(() => {
+    if (didAutoSwitchRef.current || !isAuth || !root || !authUser?.travellerIds?.length) return;
+    const linked = authUser.travellerIds.filter(tid => root.users[tid]);
+    if (linked.length === 0 || linked.includes(root.currentUser)) return;
+    didAutoSwitchRef.current = true;
+    setRoot(prev => prev ? { ...prev, currentUser: linked[0] } : prev);
+  }, [isAuth, root, authUser]);
+
   // useLayoutEffect so CSS vars are set before child effects (repaintCountries) read them
   useLayoutEffect(() => { applyPalette(t.palette); }, [t.palette]);
   useEffect(() => { document.documentElement.lang = t.language; }, [t.language]);
 
+  // Authenticated users only see travellers linked to their account.
+  const linkedTravellers = useMemo(() => {
+    if (!root) return {};
+    if (!isAuth) return root.users || {};          // unauthenticated: all visible
+    if (!authUser?.travellerIds?.length) return {}; // authenticated, no links: nothing visible
+    const tids = new Set(authUser.travellerIds);
+    return Object.fromEntries(Object.entries(root.users || {}).filter(([id]) => tids.has(id)));
+  }, [root?.users, isAuth, authUser?.travellerIds]);
+
   // Derive from root (safe to read as null — hooks below guard on currentUser)
-  const currentUser = root ? root.users[root.currentUser] : null;
+  const currentUser = root
+    ? (linkedTravellers[root.currentUser] ?? Object.values(linkedTravellers)[0] ?? null)
+    : null;
   const customTypes = root ? (root.customTypes || []) : [];
   const effectiveTypes = useEffectiveTypes(customTypes);
 
@@ -417,32 +497,68 @@ function App() {
 
   // === User mutators ===
   function addUser(name) {
-    setRoot(prev => {
-      const used = new Set(Object.values(prev.users).map(u => u.color));
-      const color = USER_COLORS.find(c => !used.has(c)) || USER_COLORS[Object.keys(prev.users).length % USER_COLORS.length];
-      const u = makeUser(name || 'New traveller', color);
-      return { ...prev, currentUser: u.id, users: { ...prev.users, [u.id]: u } };
-    });
+    const slug = (name || '').trim().toLowerCase();
+    // Link to an existing traveller with the same name rather than creating a duplicate.
+    const existing = Object.entries(root.users).find(([, u]) => u.name.trim().toLowerCase() === slug);
+    if (existing) {
+      const [existingId] = existing;
+      setRoot(prev => ({ ...prev, currentUser: existingId }));
+      if (isAuth && authUser && !(authUser.travellerIds || []).includes(existingId)) {
+        updateMyTravellers([...(authUser.travellerIds || []), existingId]);
+      }
+      setSelectedCity(null);
+      return;
+    }
+    const used = new Set(Object.values(root.users).map(u => u.color));
+    const color = USER_COLORS.find(c => !used.has(c)) || USER_COLORS[Object.keys(root.users).length % USER_COLORS.length];
+    const u = makeUser(name || 'New traveller', color, authUser?.id ?? null);
+    setRoot(prev => ({ ...prev, currentUser: u.id, users: { ...prev.users, [u.id]: u } }));
+    if (isAuth && authUser) {
+      // Claim ownership and create the link in one server round-trip.
+      // Optimistically update local travellerIds so linkedTravellers reflects the new entry.
+      setAuthUser(prev => prev ? { ...prev, travellerIds: [...(prev.travellerIds || []), u.id] } : prev);
+      fetch(`/api/travellers/${u.id}/claim`, { method: 'POST' }).catch(() => {});
+    }
     setSelectedCity(null);
   }
   function removeUser(id) {
-    setRoot(prev => {
-      const ids = Object.keys(prev.users);
-      if (ids.length <= 1) { alert(tr('cantRemoveLast')); return prev; }
-      const users = { ...prev.users }; delete users[id];
-      const cities = {};
-      for (const [k, c] of Object.entries(prev.cities || {})) {
-        const p = (c.participants || []).filter(x => x !== id);
-        if (p.length > 0) cities[k] = { ...c, participants: p };
-      }
-      const countries = {};
-      for (const c of Object.values(cities)) {
-        if (!countries[c.country]) countries[c.country] = { cities: [] };
-        countries[c.country].cities.push(c.name);
-      }
-      const nextCurrent = prev.currentUser === id ? Object.keys(users)[0] : prev.currentUser;
-      return { ...prev, currentUser: nextCurrent, users, cities, countries };
-    });
+    const linkedIds = Object.keys(linkedTravellers);
+    if (linkedIds.length <= 1) { alert(tr('cantRemoveLast')); return; }
+    const nextLinked = linkedIds.find(tid => tid !== id);
+    const traveller = linkedTravellers[id];
+    // Legacy travellers with no ownerId are treated as owned by the current user.
+    const isOwner = !traveller?.ownerId || traveller.ownerId === authUser?.id;
+
+    if (isOwner) {
+      // Owner: delete the traveller for everyone via the server endpoint.
+      setRoot(prev => {
+        const users = { ...prev.users }; delete users[id];
+        const cities = {};
+        for (const [k, c] of Object.entries(prev.cities || {})) {
+          const p = (c.participants || []).filter(x => x !== id);
+          if (p.length > 0) cities[k] = { ...c, participants: p };
+        }
+        const countries = {};
+        for (const c of Object.values(cities)) {
+          if (!countries[c.country]) countries[c.country] = { cities: [] };
+          countries[c.country].cities.push(c.name);
+        }
+        const nextCurrent = prev.currentUser === id ? (nextLinked || Object.keys(users)[0]) : prev.currentUser;
+        return { ...prev, currentUser: nextCurrent, users, cities, countries };
+      });
+      setAuthUser(prev => prev ? { ...prev, travellerIds: (prev.travellerIds || []).filter(x => x !== id) } : prev);
+      fetch(`/api/travellers/${id}`, {
+        method: 'DELETE',
+        headers: { 'X-Client-Id': clientIdRef.current },
+      }).catch(() => {});
+    } else {
+      // Non-owner: just unlink from own account; traveller remains for others.
+      setRoot(prev => {
+        const nextCurrent = prev.currentUser === id ? (nextLinked || Object.keys(prev.users).find(k => k !== id)) : prev.currentUser;
+        return { ...prev, currentUser: nextCurrent };
+      });
+      updateMyTravellers((authUser?.travellerIds || []).filter(x => x !== id));
+    }
     setSelectedCity(null);
   }
   function renameUser(id, name) {
@@ -452,6 +568,17 @@ function App() {
     setRoot(prev => ({ ...prev, currentUser: id }));
     setSelectedCity(null);
     setUserMenuOpen(false);
+  }
+
+  async function updateMyTravellers(travellerIds) {
+    const res = await fetch('/api/auth/travellers', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ travellerIds }),
+    });
+    if (res.ok) {
+      setAuthUser(prev => prev ? { ...prev, travellerIds } : prev);
+    }
   }
 
   // === City mutators (shared store) ===
@@ -564,7 +691,11 @@ function App() {
     <div className="app" data-sidebar={sidebarOpen ? 'open' : 'closed'}>
       <header className="topbar">
         <div className="brand">
-          <div className="brand-mark" dangerouslySetInnerHTML={{__html: tr('brand').replace('—', '<em>—</em>')}} />
+          <div className="brand-mark">
+            {tr('brand').split('—').flatMap((part, i) =>
+              i > 0 ? [<em key={i}>{'—'}</em>, part] : [part]
+            )}
+          </div>
           <div className="brand-tag">{tr('tag')}</div>
         </div>
 
@@ -579,28 +710,58 @@ function App() {
               <div className="stat-label">{tr('statCountries')}</div>
             </div>
           </div>
-          <UserSwitcher
-            tr={tr}
-            users={root.users}
-            currentUser={currentUser}
-            open={userMenuOpen}
-            onToggle={() => setUserMenuOpen(o => !o)}
-            onClose={() => setUserMenuOpen(false)}
-            onSwitch={switchUser}
-            onAdd={addUser}
-            onRemove={removeUser}
-            onRename={renameUser}
-          />
+          {isAuth ? (
+            <UserSwitcher
+              tr={tr}
+              users={linkedTravellers}
+              currentUser={currentUser}
+              open={userMenuOpen}
+              onToggle={() => setUserMenuOpen(o => !o)}
+              onClose={() => setUserMenuOpen(false)}
+              onSwitch={switchUser}
+              onAdd={addUser}
+              onRemove={removeUser}
+              onRename={renameUser}
+              onLogout={handleLogout}
+              userId={authUser?.id}
+            />
+          ) : (
+            <button className="auth-btn" onClick={() => setShowLogin(true)}>Sign in</button>
+          )}
+          {isAuth && authUser && (
+            <span className="topbar-user-label" title={`Signed in as ${authUser.username}`}>
+              {authUser.username}
+            </span>
+          )}
+          {isAdmin && (
+            <button
+              className="topbar-icon-btn"
+              title="User management"
+              onClick={() => setShowAdmin(true)}
+            >👥</button>
+          )}
+          {isAuth && (
+            <button
+              className="topbar-icon-btn"
+              title="Change password"
+              onClick={() => setShowChangePwd(true)}
+            >🔑</button>
+          )}
           <button
             className={`mob-sidebar-btn${sidebarOpen ? ' is-open' : ''}`}
             aria-label="Toggle city list"
             onClick={() => setSidebarOpen(o => !o)}
           >{sidebarOpen ? '✕' : '☰'}</button>
-          <button
-            className="settings-btn"
-            title="Settings & tweaks"
-            onClick={() => window.postMessage({ type: '__activate_edit_mode' }, '*')}
-          >⚙</button>
+          {isAuth && (
+            <button
+              className="settings-btn"
+              title="Settings & tweaks"
+              onClick={() => window.postMessage({ type: '__activate_edit_mode' }, '*')}
+            >⚙</button>
+          )}
+          {isAuth && (
+            <button className="auth-btn auth-btn-out" title="Sign out" onClick={handleLogout}>⏻</button>
+          )}
         </div>
       </header>
 
@@ -643,14 +804,58 @@ function App() {
           )}
         </div>
 
+        {/* Mobile: type filter strip floating over the map */}
+        <div className="m-type-strip">
+          <TypeFilter
+            tr={tr}
+            types={effectiveTypes}
+            value={typeFilter}
+            counts={countByType(data.cities)}
+            onChange={setTypeFilter}
+          />
+        </div>
+
+        {/* Mobile action bar */}
+        <div className="m-actionbar">
+          <button className="m-search" onClick={() => setSidebarOpen(true)}>
+            <span className="m-search-icon">⌕</span>
+            <span>{tr('addPlaceholder')}</span>
+          </button>
+          <button
+            className="m-fab"
+            data-state={selected || sidebarOpen ? 'close' : 'open'}
+            onClick={() => {
+              if (selected) { setSelectedCity(null); }
+              else if (sidebarOpen) { setSidebarOpen(false); }
+              else {
+                setSidebarOpen(true);
+                setTimeout(() => document.querySelector('.add-input')?.focus(), 120);
+              }
+            }}
+          >+</button>
+          {isAuth && currentUser ? (
+            <button className="m-user-chip" onClick={() => setUserMenuOpen(o => !o)}>
+              <span className="m-user-chip-av" style={{ background: currentUser.color }}>
+                {currentUser.name.slice(0, 1).toUpperCase()}
+              </span>
+              <span className="m-user-chip-nm">{currentUser.name}</span>
+            </button>
+          ) : (
+            <button className="m-user-chip" onClick={() => setShowLogin(true)}>
+              <span className="m-user-chip-nm">Sign in</span>
+            </button>
+          )}
+        </div>
+
         {selected && (
           <DetailPanel
             tr={tr}
             city={selected}
-            users={root.users}
+            users={linkedTravellers}
             currentUserId={root.currentUser}
             types={effectiveTypes}
             customTypes={customTypes}
+            isAuth={isAuth}
             onClose={() => setSelectedCity(null)}
             onToggleVisited={() => toggleVisited(selected.name)}
             onUpdate={(patch) => updateCity(selected.name, patch)}
@@ -671,7 +876,7 @@ function App() {
           <button className={`side-tab ${tab === 'all' ? 'active' : ''}`} onClick={() => setTab('all')}>{tr('tabAll')}</button>
         </div>
         <div className="side-body">
-          <CityComposer tr={tr} lang={t.language} onAdd={addCity} existing={data.cities} />
+          {isAuth && <CityComposer tr={tr} lang={t.language} onAdd={addCity} existing={data.cities} />}
           <TypeFilter
             tr={tr}
             types={effectiveTypes}
@@ -683,7 +888,7 @@ function App() {
             tr={tr}
             data={filteredData}
             allCities={root.cities}
-            users={root.users}
+            users={linkedTravellers}
             currentUserId={root.currentUser}
             filter={tab}
             types={effectiveTypes}
@@ -692,6 +897,7 @@ function App() {
             onToggleVisited={toggleVisited}
             onRemoveCity={removeCityFromCurrent}
             collapseVisited={t.collapseVisited}
+            isAuth={isAuth}
           />
         </div>
       </aside>
@@ -736,19 +942,42 @@ function App() {
           value={t.collapseVisited}
           onChange={(v) => setTweak('collapseVisited', v)}
         />
-        <window.TweakSection label={tr('tweaksData')} />
-        <window.TweakButton label={tr('tweaksReset')} secondary onClick={() => {
-          if (confirm(tr('confirmReset'))) setRoot(defaultRoot());
-        }} />
-        <window.TweakButton label={tr('tweaksClear')} secondary onClick={() => {
-          if (confirm(tr('confirmClear'))) {
-            patchRoot(prev => ({ ...prev, cities: {}, countries: {} }));
-          }
-        }} />
+        {isAdmin && <>
+          <window.TweakSection label={tr('tweaksData')} />
+          <window.TweakButton label={tr('tweaksReset')} secondary onClick={() => {
+            if (confirm(tr('confirmReset'))) setRoot(defaultRoot());
+          }} />
+          <window.TweakButton label={tr('tweaksClear')} secondary onClick={() => {
+            if (confirm(tr('confirmClear'))) {
+              patchRoot(prev => ({ ...prev, cities: {}, countries: {} }));
+            }
+          }} />
+        </>}
       </window.TweaksPanel>
 
       {sidebarOpen && (
         <div className="sidebar-backdrop" onClick={() => setSidebarOpen(false)} />
+      )}
+
+      {showLogin && (
+        <LoginModal
+          onClose={() => { setShowLogin(false); setLoginError(''); }}
+          onLogin={handleLogin}
+          error={loginError}
+          loading={loginLoading}
+        />
+      )}
+
+      {showAdmin && (
+        <AdminPanel
+          onClose={() => setShowAdmin(false)}
+          currentUserId={authUser?.id}
+          travellers={root.users}
+        />
+      )}
+
+      {showChangePwd && (
+        <ChangePasswordModal onClose={() => setShowChangePwd(false)} />
       )}
     </div>
   );
@@ -765,71 +994,189 @@ function countByType(cities) {
 }
 
 // === User Switcher ===
-function UserSwitcher({ tr, users, currentUser, open, onToggle, onClose, onSwitch, onAdd, onRemove, onRename }) {
+function UserSwitcher({ tr, users, currentUser, open, onToggle, onClose, onSwitch, onAdd, onRemove, onRename, onLogout, userId }) {
   const [renaming, setRenaming] = useState(null);
   const [newName, setNewName] = useState("");
+  // Sharing panel state
+  const [sharingFor, setSharingFor] = useState(null);
+  const [sharingInfo, setSharingInfo] = useState({});
+  const [shareInput, setShareInput] = useState('');
+  const [shareError, setShareError] = useState('');
   const rootRef = useRef(null);
+
   useEffect(() => {
     if (!open) return;
     function onDoc(e) { if (rootRef.current && !rootRef.current.contains(e.target)) onClose(); }
     document.addEventListener('mousedown', onDoc);
     return () => document.removeEventListener('mousedown', onDoc);
   }, [open]);
+  useEffect(() => {
+    if (!open) { setSharingFor(null); setShareInput(''); setShareError(''); }
+  }, [open]);
 
-  if (!currentUser) return null;
+  async function openSharing(tid) {
+    if (sharingFor === tid) { setSharingFor(null); return; }
+    setSharingFor(tid);
+    setSharingInfo(prev => ({ ...prev, [tid]: 'loading' }));
+    try {
+      const r = await fetch(`/api/travellers/${tid}/sharing`);
+      const data = await r.json();
+      setSharingInfo(prev => ({ ...prev, [tid]: r.ok ? data : { error: data.error } }));
+    } catch {
+      setSharingInfo(prev => ({ ...prev, [tid]: { error: 'Network error' } }));
+    }
+  }
+
+  async function shareWith(tid) {
+    setShareError('');
+    const name = shareInput.trim();
+    if (!name) return;
+    const r = await fetch(`/api/travellers/${tid}/share`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: name }),
+    });
+    const data = await r.json();
+    if (r.ok) {
+      setShareInput('');
+      setSharingInfo(prev => {
+        const info = prev[tid];
+        if (!info || typeof info !== 'object' || info.error) return prev;
+        return { ...prev, [tid]: { ...info, sharedWith: [...info.sharedWith, { ...data.user, isOwner: false }] } };
+      });
+    } else {
+      setShareError(data.error || 'Failed to share');
+    }
+  }
+
+  async function revokeAccess(tid, targetUserId) {
+    const r = await fetch(`/api/travellers/${tid}/share/${targetUserId}`, { method: 'DELETE' });
+    if (r.ok) {
+      setSharingInfo(prev => {
+        const info = prev[tid];
+        if (!info || typeof info !== 'object' || info.error) return prev;
+        return { ...prev, [tid]: { ...info, sharedWith: info.sharedWith.filter(u => u.id !== targetUserId) } };
+      });
+    }
+  }
+
   const userList = Object.values(users);
 
   return (
     <div className="user-switcher" ref={rootRef}>
       <button className="user-chip" onClick={onToggle}>
-        <span className="user-avatar" style={{ background: currentUser.color }}>
-          {currentUser.name.slice(0, 1).toUpperCase()}
-        </span>
-        <span className="user-name">{currentUser.name}</span>
+        {currentUser ? (
+          <>
+            <span className="user-avatar" style={{ background: currentUser.color }}>
+              {currentUser.name.slice(0, 1).toUpperCase()}
+            </span>
+            <span className="user-name">{currentUser.name}</span>
+          </>
+        ) : (
+          <span className="user-name">No traveller</span>
+        )}
         <span className="user-caret">▾</span>
       </button>
       {open && (
         <div className="user-menu">
           <div className="user-menu-head">{tr('travellers')}</div>
-          {userList.map(u => (
-            <div key={u.id} className={`user-row ${u.id === currentUser.id ? 'is-current' : ''}`}>
-              <span className="user-avatar sm" style={{ background: u.color }}>
-                {u.name.slice(0, 1).toUpperCase()}
-              </span>
-              {renaming === u.id ? (
-                <input
-                  className="user-rename"
-                  value={newName}
-                  autoFocus
-                  onChange={(e) => setNewName(e.target.value)}
-                  onBlur={() => {
-                    if (newName.trim()) onRename(u.id, newName.trim());
-                    setRenaming(null);
-                  }}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') e.target.blur();
-                    if (e.key === 'Escape') { setRenaming(null); }
-                  }}
-                />
-              ) : (
-                <span
-                  className="user-row-name"
-                  onClick={() => onSwitch(u.id)}
-                  onDoubleClick={() => { setRenaming(u.id); setNewName(u.name); }}
-                  title={tr('switchTo') + ' ' + u.name}
-                >{u.name}</span>
-              )}
-              {userList.length > 1 && (
-                <button className="user-row-del" onClick={() => {
-                  if (confirm(tr('confirmRemoveUser', u.name))) onRemove(u.id);
-                }} title={tr('removeTraveller')}>×</button>
-              )}
-            </div>
-          ))}
+          {userList.length === 0 ? (
+            <div className="user-menu-empty">No linked travellers</div>
+          ) : userList.map(u => {
+            // Legacy travellers with no ownerId are editable by the current user.
+            const isOwner = !u.ownerId || u.ownerId === userId;
+            const isCurrent = u.id === currentUser?.id;
+            const info = sharingInfo[u.id];
+            return (
+              <div key={u.id}>
+                <div className={`user-row ${isCurrent ? 'is-current' : ''}`}>
+                  <span className="user-avatar sm" style={{ background: u.color }}>
+                    {u.name.slice(0, 1).toUpperCase()}
+                  </span>
+                  {renaming === u.id ? (
+                    <input
+                      className="user-rename"
+                      value={newName}
+                      autoFocus
+                      onChange={(e) => setNewName(e.target.value)}
+                      onBlur={() => {
+                        if (newName.trim()) onRename(u.id, newName.trim());
+                        setRenaming(null);
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') e.target.blur();
+                        if (e.key === 'Escape') setRenaming(null);
+                      }}
+                    />
+                  ) : (
+                    <span
+                      className="user-row-name"
+                      onClick={() => onSwitch(u.id)}
+                      onDoubleClick={isOwner ? () => { setRenaming(u.id); setNewName(u.name); } : undefined}
+                      title={tr('switchTo') + ' ' + u.name}
+                    >{u.name}</span>
+                  )}
+                  {isOwner && (
+                    <button
+                      className={`user-row-share${sharingFor === u.id ? ' is-active' : ''}`}
+                      title="Manage sharing"
+                      onClick={(e) => { e.stopPropagation(); openSharing(u.id); }}
+                    >🔗</button>
+                  )}
+                  {isOwner ? (
+                    userList.length > 1 && (
+                      <button className="user-row-del" title="Delete for everyone" onClick={() => {
+                        if (confirm(tr('confirmRemoveUser', u.name))) onRemove(u.id);
+                      }}>×</button>
+                    )
+                  ) : (
+                    <button className="user-row-del user-row-leave" title="Leave — unlink from your account" onClick={() => {
+                      if (confirm(`Leave "${u.name}"? The owner can re-add you.`)) onRemove(u.id);
+                    }}>↩</button>
+                  )}
+                </div>
+                {sharingFor === u.id && isOwner && (
+                  <div className="sharing-panel">
+                    {info === 'loading' && <div className="sharing-status">Loading…</div>}
+                    {info && info.error && <div className="sharing-status sharing-error">{info.error}</div>}
+                    {info && !info.error && info !== 'loading' && (
+                      <>
+                        <div className="sharing-list">
+                          {info.sharedWith.filter(su => !su.isOwner).length === 0
+                            ? <div className="sharing-none">Not shared with anyone yet</div>
+                            : info.sharedWith.filter(su => !su.isOwner).map(su => (
+                              <div key={su.id} className="sharing-user">
+                                <span className="sharing-username">{su.username}</span>
+                                <button className="sharing-revoke" onClick={() => revokeAccess(u.id, su.id)} title="Revoke access">×</button>
+                              </div>
+                            ))
+                          }
+                        </div>
+                        <div className="sharing-add">
+                          <input
+                            className="sharing-input"
+                            placeholder="Username…"
+                            value={shareInput}
+                            onChange={e => { setShareInput(e.target.value); setShareError(''); }}
+                            onKeyDown={e => { if (e.key === 'Enter') shareWith(u.id); }}
+                          />
+                          <button className="sharing-btn" onClick={() => shareWith(u.id)}>Share</button>
+                        </div>
+                        {shareError && <div className="sharing-status sharing-error">{shareError}</div>}
+                      </>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })}
           <button className="user-add-btn" onClick={() => {
             const name = prompt(tr('travellerName') + ':', '');
             if (name && name.trim()) onAdd(name.trim());
           }}>+ {tr('addTraveller')}</button>
+          {onLogout && (
+            <button className="user-signout-btn" onClick={() => { onClose(); onLogout(); }}>⏻ Sign out</button>
+          )}
         </div>
       )}
     </div>
@@ -963,7 +1310,7 @@ function CityComposer({ tr, lang, onAdd, existing }) {
 }
 
 // === Country list ===
-function CountryList({ tr, data, allCities, users, currentUserId, filter, types, selectedCity, onSelectCity, onToggleVisited, onRemoveCity, collapseVisited }) {
+function CountryList({ tr, data, allCities, users, currentUserId, filter, types, selectedCity, onSelectCity, onToggleVisited, onRemoveCity, collapseVisited, isAuth }) {
   const [collapsed, setCollapsed] = useState({});
   const typeById = useMemo(() => Object.fromEntries((types || []).map(t => [t.id, t])), [types]);
 
@@ -1016,14 +1363,14 @@ function CountryList({ tr, data, allCities, users, currentUserId, filter, types,
                       onClick={() => onSelectCity(city.name)}
                     >
                       <span
-                        className={`city-check ${city.visited ? 'checked' : ''}`}
-                        onClick={(e) => { e.stopPropagation(); onToggleVisited(city.name); }}
+                        className={`city-check ${city.visited ? 'checked' : ''}${!isAuth ? ' readonly' : ''}`}
+                        onClick={isAuth ? (e) => { e.stopPropagation(); onToggleVisited(city.name); } : (e) => e.stopPropagation()}
                       ></span>
                       <span className={`city-label ${city.visited ? 'visited' : ''}`}>{city.name}</span>
-                      {vt && (
+                      {isAuth && vt && (
                         <span className="city-type-glyph" style={{ color: vt.color }} title={vt._custom ? vt.label : tr(vt.key)}>{vt.glyph}</span>
                       )}
-                      {others.length > 0 && (
+                      {isAuth && others.length > 0 && (
                         <span className="city-shared" title={tr('sharedWith', others.length)}>
                           {others.slice(0, 3).map(id => {
                             const u = users[id]; if (!u) return null;
@@ -1035,10 +1382,10 @@ function CountryList({ tr, data, allCities, users, currentUserId, filter, types,
                       {city.photos && city.photos.length > 0 && (
                         <span className="city-photo-count">{city.photos.length} ph</span>
                       )}
-                      <span className="city-del" onClick={(e) => {
+                      {isAuth && <span className="city-del" onClick={(e) => {
                         e.stopPropagation();
                         if (confirm(tr('confirmRemoveShort', city.name))) onRemoveCity(city.name);
-                      }}>×</span>
+                      }}>×</span>}
                     </li>
                   );
                 })}
@@ -1178,9 +1525,38 @@ function CustomTypeManager({ tr, customTypes, onAdd, onRemove, onUpdate }) {
 }
 
 // === Detail panel ===
-function DetailPanel({ tr, city, users, currentUserId, types, customTypes, onClose, onToggleVisited, onUpdate, onAddPhoto, onRemovePhoto, onRemove, onOpenPhoto, onToggleParticipant, onAddCustomType }) {
+function DetailPanel({ tr, city, users, currentUserId, types, customTypes, isAuth, onClose, onToggleVisited, onUpdate, onAddPhoto, onRemovePhoto, onRemove, onOpenPhoto, onToggleParticipant, onAddCustomType }) {
   const fileRef = useRef(null);
   const [showInlineType, setShowInlineType] = useState(false);
+  const sheetRef = useRef(null);
+  const dragRef = useRef(null);
+  const [sheetState, setSheetState] = useState('peek');
+
+  useEffect(() => { setSheetState('peek'); }, [city.name]);
+
+  function onPointerDown(e) {
+    if (!sheetRef.current) return;
+    const rect = sheetRef.current.getBoundingClientRect();
+    if (e.clientY - rect.top > 64) return;
+    dragRef.current = { y: e.clientY, h: sheetRef.current.offsetHeight };
+    sheetRef.current.setPointerCapture(e.pointerId);
+  }
+  function onPointerMove(e) {
+    if (!dragRef.current) return;
+    const dy = dragRef.current.y - e.clientY;
+    sheetRef.current.style.height = `${Math.max(80, dragRef.current.h + dy)}px`;
+  }
+  function onPointerUp() {
+    if (!dragRef.current) return;
+    const h = sheetRef.current.offsetHeight;
+    const pct = h / window.innerHeight;
+    if (pct < 0.20) { sheetRef.current.style.height = ''; dragRef.current = null; onClose?.(); return; }
+    const stops = { peek: 0.40, full: 0.92 };
+    const nearest = Object.entries(stops).reduce((a, b) => Math.abs(b[1] - pct) < Math.abs(a[1] - pct) ? b : a);
+    setSheetState(nearest[0]);
+    sheetRef.current.style.height = '';
+    dragRef.current = null;
+  }
   const [inlineLabel, setInlineLabel] = useState("");
   const [inlineColor, setInlineColor] = useState(CUSTOM_TYPE_COLORS[0]);
   const [inlineGlyph, setInlineGlyph] = useState(CUSTOM_TYPE_GLYPHS[0]);
@@ -1219,7 +1595,9 @@ function DetailPanel({ tr, city, users, currentUserId, types, customTypes, onClo
   const photoCount = (city.photos || []).length;
 
   return (
-    <div className="detail">
+    <div className="detail" ref={sheetRef} data-state={sheetState}
+         onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerUp}>
+      <div className="detail-handle" />
       <div className="detail-head">
         <button className="detail-close" onClick={onClose}>×</button>
         <div className="detail-country">{city.country}</div>
@@ -1232,23 +1610,28 @@ function DetailPanel({ tr, city, users, currentUserId, types, customTypes, onClo
         )}
       </div>
       <div className="detail-body">
-        <div className={`detail-toggle ${city.visited ? 'is-visited' : ''}`} onClick={onToggleVisited}>
+        <div
+          className={`detail-toggle ${city.visited ? 'is-visited' : ''}${!isAuth ? ' readonly' : ''}`}
+          onClick={isAuth ? onToggleVisited : undefined}
+        >
           {city.visited ? tr('detailVisited') : tr('detailWishlist')}
-          <span className="pill">{city.visited ? tr('tapToUndo') : tr('tapToVisit')}</span>
+          {isAuth && <span className="pill">{city.visited ? tr('tapToUndo') : tr('tapToVisit')}</span>}
         </div>
 
-        <div className="field-block">
-          <div className="field-label">{tr('participants')}</div>
-          <ParticipantsPicker
-            tr={tr}
-            city={city}
-            users={users}
-            currentUserId={currentUserId}
-            onToggle={onToggleParticipant}
-          />
-        </div>
+        {isAuth && (
+          <div className="field-block">
+            <div className="field-label">{tr('participants')}</div>
+            <ParticipantsPicker
+              tr={tr}
+              city={city}
+              users={users}
+              currentUserId={currentUserId}
+              onToggle={onToggleParticipant}
+            />
+          </div>
+        )}
 
-        <div className="field-block">
+        {isAuth && <div className="field-block">
           <div className="field-label">{tr('vacationType')}</div>
           <div className="type-picker">
             <button
@@ -1304,45 +1687,398 @@ function DetailPanel({ tr, city, users, currentUserId, types, customTypes, onClo
               </div>
             </div>
           )}
-        </div>
+        </div>}
 
         {city.visited && (
           <div className="field-block">
             <div className="field-label">{tr('whenVisited')}</div>
-            <input className="field-input" type="month" value={city.visitDate || ""}
-                   onChange={(e) => onUpdate({ visitDate: e.target.value })} />
+            {isAuth
+              ? <input className="field-input" type="month" value={city.visitDate || ""}
+                       onChange={(e) => onUpdate({ visitDate: e.target.value })} />
+              : <div className="field-input-ro">{city.visitDate || '—'}</div>
+            }
           </div>
         )}
 
         <div className="field-block">
           <div className="field-label">{tr('notes')}</div>
-          <textarea className="field-textarea" value={city.notes || ""}
-            placeholder={city.visited ? tr('notesPlaceholderVisited') : tr('notesPlaceholderWanted')}
-            onChange={(e) => onUpdate({ notes: e.target.value })} />
+          {isAuth
+            ? <textarea className="field-textarea" value={city.notes || ""}
+                placeholder={city.visited ? tr('notesPlaceholderVisited') : tr('notesPlaceholderWanted')}
+                onChange={(e) => onUpdate({ notes: e.target.value })} />
+            : <div className="field-textarea-ro">{city.notes || <span className="field-empty">—</span>}</div>
+          }
         </div>
 
-        <div className="field-block">
-          <div className="field-label">{tr('memories')} — {photoCount} {photoCount === 1 ? tr('photo') : tr('photos')}</div>
-          <div className="photo-grid">
-            {(city.photos || []).map(p => (
-              <div key={p.id} className="photo-tile">
-                <img src={p.src} alt="" onClick={() => onOpenPhoto(p.src)} />
-                <button className="photo-del" onClick={() => onRemovePhoto(p.id)}>×</button>
-              </div>
-            ))}
-            <label className="photo-add">
-              <input ref={fileRef} type="file" accept="image/*" multiple style={{ display: 'none' }}
-                onChange={(e) => { handleFiles(e.target.files); e.target.value = ''; }} />
-              <span className="plus">+</span>
-              <span>{tr('addPhoto')}</span>
-            </label>
+        {(isAuth || photoCount > 0) && (
+          <div className="field-block">
+            <div className="field-label">{tr('memories')} — {photoCount} {photoCount === 1 ? tr('photo') : tr('photos')}</div>
+            <div className="photo-grid">
+              {(city.photos || []).map(p => (
+                <div key={p.id} className="photo-tile">
+                  <img src={p.src} alt="" onClick={() => onOpenPhoto(p.src)} />
+                  {isAuth && <button className="photo-del" onClick={() => onRemovePhoto(p.id)}>×</button>}
+                </div>
+              ))}
+              {isAuth && (
+                <label className="photo-add">
+                  <input ref={fileRef} type="file" accept="image/*" multiple style={{ display: 'none' }}
+                    onChange={(e) => { handleFiles(e.target.files); e.target.value = ''; }} />
+                  <span className="plus">+</span>
+                  <span>{tr('addPhoto')}</span>
+                </label>
+              )}
+            </div>
           </div>
+        )}
+
+        {isAuth && (
+          <div className="danger-row">
+            <button className="danger-btn" onClick={() => {
+              if (confirm(tr('confirmRemove', city.name))) onRemove();
+            }}>{tr('removeCity')}</button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// === Login modal ===
+function LoginModal({ onClose, onLogin, error, loading }) {
+  const [username, setUsername] = useState('');
+  const [pw, setPw] = useState('');
+  const pwRef = useRef(null);
+  function submit() { if (username.trim() && pw) onLogin(username.trim(), pw); }
+  return (
+    <div className="login-overlay" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+      <div className="login-modal">
+        <button className="login-close" onClick={onClose}>×</button>
+        <div className="login-title">Sign in to edit</div>
+        <div className="login-sub">Enter your credentials to add or change places.</div>
+        <input
+          className="login-input"
+          type="text"
+          placeholder="Username"
+          value={username}
+          autoFocus
+          autoComplete="username"
+          onChange={e => setUsername(e.target.value)}
+          onKeyDown={e => {
+            if (e.key === 'Enter' && username.trim()) pwRef.current?.focus();
+            if (e.key === 'Escape') onClose();
+          }}
+        />
+        <input
+          ref={pwRef}
+          className="login-input"
+          type="password"
+          placeholder="Password"
+          value={pw}
+          autoComplete="current-password"
+          onChange={e => setPw(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Enter') submit(); if (e.key === 'Escape') onClose(); }}
+        />
+        {error && <div className="login-error">{error}</div>}
+        <div className="login-actions">
+          <button className="login-btn" onClick={submit} disabled={loading || !username.trim() || !pw}>
+            {loading ? 'Signing in…' : 'Sign in'}
+          </button>
+          <button className="login-guest" onClick={onClose}>Continue as guest</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// === Traveller picker (used in admin panel) ===
+function TravellerPicker({ travellers, selected, onChange }) {
+  const list = Object.values(travellers || {});
+  if (list.length === 0) return <div className="admin-state-msg" style={{padding:'4px 0'}}>No travellers in map yet.</div>;
+  return (
+    <div className="admin-traveller-picker">
+      {list.map(t => (
+        <label key={t.id} className={`admin-traveller-opt ${selected.includes(t.id) ? 'is-checked' : ''}`}>
+          <input
+            type="checkbox"
+            checked={selected.includes(t.id)}
+            onChange={e => onChange(e.target.checked ? [...selected, t.id] : selected.filter(x => x !== t.id))}
+          />
+          <span className="user-avatar sm" style={{ background: t.color }}>{t.name.slice(0,1).toUpperCase()}</span>
+          <span className="admin-traveller-name">{t.name}</span>
+        </label>
+      ))}
+    </div>
+  );
+}
+
+// === Admin panel: user management ===
+function AdminPanel({ onClose, currentUserId, travellers }) {
+  const [users, setUsers] = useState(null);
+  const [error, setError] = useState('');
+  const [success, setSuccess] = useState('');
+  const [creating, setCreating] = useState(false);
+  const [newUsername, setNewUsername] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [newRole, setNewRole] = useState('user');
+  const [newTravellerIds, setNewTravellerIds] = useState([]);
+  const [editingId, setEditingId] = useState(null);
+  const [editPassword, setEditPassword] = useState('');
+  const [editRole, setEditRole] = useState('');
+  const [editTravellerIds, setEditTravellerIds] = useState([]);
+
+  useEffect(() => { loadUsers(); }, []);
+
+  async function loadUsers() {
+    try {
+      const res = await fetch('/api/admin/users');
+      if (!res.ok) { setError('Failed to load users'); return; }
+      setUsers(await res.json());
+    } catch (e) { setError('Connection error'); }
+  }
+
+  function clearMessages() { setError(''); setSuccess(''); }
+  function cancelEdit() { setEditingId(null); setEditPassword(''); setEditRole(''); setEditTravellerIds([]); }
+
+  function startEdit(u) {
+    setEditingId(u.id);
+    setEditRole(u.role);
+    setEditPassword('');
+    setEditTravellerIds(u.traveller_ids || []);
+    clearMessages();
+  }
+
+  async function createUser() {
+    clearMessages();
+    const res = await fetch('/api/admin/users', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: newUsername, password: newPassword, role: newRole, travellerIds: newTravellerIds }),
+    });
+    const d = await res.json();
+    if (!res.ok) { setError(d.error); return; }
+    setCreating(false);
+    setNewUsername(''); setNewPassword(''); setNewRole('user'); setNewTravellerIds([]);
+    setSuccess(`User "${d.username}" created.`);
+    loadUsers();
+  }
+
+  async function updateUser(id) {
+    clearMessages();
+    const body = { travellerIds: editTravellerIds };
+    if (editPassword) body.password = editPassword;
+    if (editRole) body.role = editRole;
+    const res = await fetch(`/api/admin/users/${id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const d = await res.json();
+    if (!res.ok) { setError(d.error); return; }
+    cancelEdit();
+    setSuccess('User updated.');
+    loadUsers();
+  }
+
+  async function deleteUser(id, username) {
+    if (!confirm(`Delete user "${username}"? This cannot be undone.`)) return;
+    clearMessages();
+    const res = await fetch(`/api/admin/users/${id}`, { method: 'DELETE' });
+    const d = await res.json();
+    if (!res.ok) { setError(d.error); return; }
+    setSuccess(`User "${username}" deleted.`);
+    loadUsers();
+  }
+
+  return (
+    <div className="login-overlay" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+      <div className="admin-modal">
+        <button className="login-close" onClick={onClose}>×</button>
+        <div className="login-title">User Management</div>
+
+        {error && <div className="login-error">{error}</div>}
+        {success && <div className="admin-success">{success}</div>}
+
+        <div className="admin-user-list">
+          {users === null ? (
+            <div className="admin-state-msg">Loading…</div>
+          ) : users.length === 0 ? (
+            <div className="admin-state-msg">No users found.</div>
+          ) : users.map(u => {
+            const linkedTravellers = (u.traveller_ids || []).map(tid => (travellers || {})[tid]).filter(Boolean);
+            return (
+              <div key={u.id} className="admin-user-row">
+                <div className="admin-user-info">
+                  <span className="user-avatar sm" style={{ background: u.id === currentUserId ? 'var(--accent)' : 'var(--ink-mute)' }}>
+                    {u.username.slice(0, 1).toUpperCase()}
+                  </span>
+                  <span className="admin-username">{u.username}</span>
+                  <span className={`admin-role-badge admin-role-${u.role}`}>{u.role}</span>
+                  {linkedTravellers.length > 0 && (
+                    <span className="admin-linked-travellers">
+                      {linkedTravellers.map(t => (
+                        <span key={t.id} className="user-avatar sm" style={{ background: t.color }} title={t.name}>
+                          {t.name.slice(0, 1).toUpperCase()}
+                        </span>
+                      ))}
+                    </span>
+                  )}
+                  <span className="admin-created">{new Date(u.created_at).toLocaleDateString()}</span>
+                </div>
+                {editingId === u.id ? (
+                  <div className="admin-edit-form">
+                    <input
+                      className="login-input"
+                      type="password"
+                      placeholder="New password (leave blank to keep)"
+                      value={editPassword}
+                      autoFocus
+                      autoComplete="new-password"
+                      onChange={e => setEditPassword(e.target.value)}
+                    />
+                    <div className="admin-role-row">
+                      <label className="admin-role-label">Role:</label>
+                      <select className="admin-role-select" value={editRole} onChange={e => setEditRole(e.target.value)}>
+                        <option value="user">user</option>
+                        <option value="admin">admin</option>
+                      </select>
+                    </div>
+                    <div className="admin-traveller-section">
+                      <div className="admin-role-label">Linked travellers:</div>
+                      <TravellerPicker travellers={travellers} selected={editTravellerIds} onChange={setEditTravellerIds} />
+                    </div>
+                    <div className="admin-actions-row">
+                      <button className="login-btn admin-save-btn" onClick={() => updateUser(u.id)}>Save</button>
+                      <button className="login-guest" onClick={cancelEdit}>Cancel</button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="admin-row-btns">
+                    <button className="admin-edit-btn" onClick={() => startEdit(u)}>Edit</button>
+                    {u.id !== currentUserId && (
+                      <button className="admin-del-btn" onClick={() => deleteUser(u.id, u.username)}>Delete</button>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })}
         </div>
 
-        <div className="danger-row">
-          <button className="danger-btn" onClick={() => {
-            if (confirm(tr('confirmRemove', city.name))) onRemove();
-          }}>{tr('removeCity')}</button>
+        <div className="admin-footer">
+          {!creating ? (
+            <button className="ctype-add-btn" onClick={() => { setCreating(true); clearMessages(); }}>+ Add user</button>
+          ) : (
+            <div className="admin-create-form">
+              <div className="admin-create-title">New user</div>
+              <input
+                className="login-input"
+                type="text"
+                placeholder="Username (2–32 chars)"
+                value={newUsername}
+                autoFocus
+                autoComplete="username"
+                onChange={e => setNewUsername(e.target.value)}
+              />
+              <input
+                className="login-input"
+                type="password"
+                placeholder="Password (min 8 chars)"
+                value={newPassword}
+                autoComplete="new-password"
+                onChange={e => setNewPassword(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter' && newUsername.trim().length >= 2 && newPassword.length >= 8) createUser(); }}
+              />
+              <div className="admin-role-row">
+                <label className="admin-role-label">Role:</label>
+                <select className="admin-role-select" value={newRole} onChange={e => setNewRole(e.target.value)}>
+                  <option value="user">user</option>
+                  <option value="admin">admin</option>
+                </select>
+              </div>
+              <div className="admin-traveller-section">
+                <div className="admin-role-label">Linked travellers:</div>
+                <TravellerPicker travellers={travellers} selected={newTravellerIds} onChange={setNewTravellerIds} />
+              </div>
+              <div className="admin-actions-row">
+                <button
+                  className="login-btn admin-save-btn"
+                  onClick={createUser}
+                  disabled={newUsername.trim().length < 2 || newPassword.length < 8}
+                >Create user</button>
+                <button className="login-guest" onClick={() => { setCreating(false); setNewUsername(''); setNewPassword(''); setNewRole('user'); setNewTravellerIds([]); }}>Cancel</button>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// === Change password modal (all authenticated users) ===
+function ChangePasswordModal({ onClose }) {
+  const [currentPw, setCurrentPw] = useState('');
+  const [newPw, setNewPw] = useState('');
+  const [error, setError] = useState('');
+  const [success, setSuccess] = useState('');
+  const [loading, setLoading] = useState(false);
+  const newPwRef = useRef(null);
+
+  async function submit() {
+    if (!currentPw || !newPw) return;
+    if (newPw.length < 8) { setError('New password must be at least 8 characters'); return; }
+    setLoading(true);
+    setError('');
+    try {
+      const res = await fetch('/api/auth/password', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ currentPassword: currentPw, newPassword: newPw }),
+      });
+      const d = await res.json();
+      if (res.ok) {
+        setSuccess('Password changed successfully.');
+        setCurrentPw(''); setNewPw('');
+      } else {
+        setError(d.error || 'Failed to change password');
+      }
+    } catch (e) { setError('Connection error'); }
+    setLoading(false);
+  }
+
+  return (
+    <div className="login-overlay" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+      <div className="login-modal">
+        <button className="login-close" onClick={onClose}>×</button>
+        <div className="login-title">Change Password</div>
+        <input
+          className="login-input"
+          type="password"
+          placeholder="Current password"
+          value={currentPw}
+          autoFocus
+          autoComplete="current-password"
+          onChange={e => setCurrentPw(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Enter' && currentPw) newPwRef.current?.focus(); if (e.key === 'Escape') onClose(); }}
+        />
+        <input
+          ref={newPwRef}
+          className="login-input"
+          type="password"
+          placeholder="New password (min 8 chars)"
+          value={newPw}
+          autoComplete="new-password"
+          onChange={e => setNewPw(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Enter') submit(); if (e.key === 'Escape') onClose(); }}
+        />
+        {error && <div className="login-error">{error}</div>}
+        {success && <div className="admin-success">{success}</div>}
+        <div className="login-actions">
+          <button className="login-btn" onClick={submit} disabled={loading || !currentPw || !newPw}>
+            {loading ? 'Saving…' : 'Change password'}
+          </button>
+          <button className="login-guest" onClick={onClose}>Cancel</button>
         </div>
       </div>
     </div>
