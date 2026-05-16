@@ -827,7 +827,10 @@ function App() {
             onClick={() => {
               if (selected) { setSelectedCity(null); }
               else if (sidebarOpen) { setSidebarOpen(false); }
-              else { setSidebarOpen(true); }
+              else {
+                setSidebarOpen(true);
+                setTimeout(() => document.querySelector('.add-input')?.focus(), 120);
+              }
             }}
           >+</button>
           {isAuth && currentUser ? (
