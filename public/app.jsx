@@ -803,6 +803,46 @@ function App() {
           )}
         </div>
 
+        {/* Mobile: type filter strip floating over the map */}
+        <div className="m-type-strip">
+          <TypeFilter
+            tr={tr}
+            types={effectiveTypes}
+            value={typeFilter}
+            counts={countByType(data.cities)}
+            onChange={setTypeFilter}
+          />
+        </div>
+
+        {/* Mobile action bar */}
+        <div className="m-actionbar">
+          <button className="m-search" onClick={() => setSidebarOpen(true)}>
+            <span className="m-search-icon">⌕</span>
+            <span>{tr('addPlaceholder')}</span>
+          </button>
+          <button
+            className="m-fab"
+            data-state={selected || sidebarOpen ? 'close' : 'open'}
+            onClick={() => {
+              if (selected) { setSelectedCity(null); }
+              else if (sidebarOpen) { setSidebarOpen(false); }
+              else { setSidebarOpen(true); }
+            }}
+          >+</button>
+          {isAuth && currentUser ? (
+            <button className="m-user-chip" onClick={() => setUserMenuOpen(o => !o)}>
+              <span className="m-user-chip-av" style={{ background: currentUser.color }}>
+                {currentUser.name.slice(0, 1).toUpperCase()}
+              </span>
+              <span className="m-user-chip-nm">{currentUser.name}</span>
+            </button>
+          ) : (
+            <button className="m-user-chip" onClick={() => setShowLogin(true)}>
+              <span className="m-user-chip-nm">Sign in</span>
+            </button>
+          )}
+        </div>
+
         {selected && (
           <DetailPanel
             tr={tr}
@@ -1481,6 +1521,35 @@ function CustomTypeManager({ tr, customTypes, onAdd, onRemove, onUpdate }) {
 function DetailPanel({ tr, city, users, currentUserId, types, customTypes, isAuth, onClose, onToggleVisited, onUpdate, onAddPhoto, onRemovePhoto, onRemove, onOpenPhoto, onToggleParticipant, onAddCustomType }) {
   const fileRef = useRef(null);
   const [showInlineType, setShowInlineType] = useState(false);
+  const sheetRef = useRef(null);
+  const dragRef = useRef(null);
+  const [sheetState, setSheetState] = useState('peek');
+
+  useEffect(() => { setSheetState('peek'); }, [city.name]);
+
+  function onPointerDown(e) {
+    if (!sheetRef.current) return;
+    const rect = sheetRef.current.getBoundingClientRect();
+    if (e.clientY - rect.top > 64) return;
+    dragRef.current = { y: e.clientY, h: sheetRef.current.offsetHeight };
+    sheetRef.current.setPointerCapture(e.pointerId);
+  }
+  function onPointerMove(e) {
+    if (!dragRef.current) return;
+    const dy = dragRef.current.y - e.clientY;
+    sheetRef.current.style.height = `${Math.max(80, dragRef.current.h + dy)}px`;
+  }
+  function onPointerUp() {
+    if (!dragRef.current) return;
+    const h = sheetRef.current.offsetHeight;
+    const pct = h / window.innerHeight;
+    if (pct < 0.20) { sheetRef.current.style.height = ''; dragRef.current = null; onClose?.(); return; }
+    const stops = { peek: 0.40, full: 0.92 };
+    const nearest = Object.entries(stops).reduce((a, b) => Math.abs(b[1] - pct) < Math.abs(a[1] - pct) ? b : a);
+    setSheetState(nearest[0]);
+    sheetRef.current.style.height = '';
+    dragRef.current = null;
+  }
   const [inlineLabel, setInlineLabel] = useState("");
   const [inlineColor, setInlineColor] = useState(CUSTOM_TYPE_COLORS[0]);
   const [inlineGlyph, setInlineGlyph] = useState(CUSTOM_TYPE_GLYPHS[0]);
@@ -1519,7 +1588,9 @@ function DetailPanel({ tr, city, users, currentUserId, types, customTypes, isAut
   const photoCount = (city.photos || []).length;
 
   return (
-    <div className="detail">
+    <div className="detail" ref={sheetRef} data-state={sheetState}
+         onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerUp}>
+      <div className="detail-handle" />
       <div className="detail-head">
         <button className="detail-close" onClick={onClose}>×</button>
         <div className="detail-country">{city.country}</div>
