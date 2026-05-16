@@ -958,6 +958,15 @@ input, textarea, select { font-family: inherit; color: inherit; }
   transition: all var(--dur-fast);
 }
 .user-add-btn:hover { background: var(--bg-soft); color: var(--ink); }
+.user-signout-btn {
+  width: 100%; margin-top: 2px; padding: 9px;
+  font-size: var(--t-meta); font-weight: 500;
+  border-top: 1px solid var(--line-soft);
+  border-radius: var(--r-sm);
+  text-align: center; color: var(--danger);
+  transition: all var(--dur-fast);
+}
+.user-signout-btn:hover { background: var(--danger-bg); }
 .user-menu-empty {
   padding: 8px 12px;
   font-size: var(--t-meta);
@@ -1620,6 +1629,9 @@ input, textarea, select { font-family: inherit; color: inherit; }
   /* Map fills remaining space */
   .map-wrap { height: calc(100dvh - var(--m-topbar-h)); }
 
+  /* Hide Leaflet zoom controls on mobile (pinch-to-zoom is standard) */
+  .leaflet-control-zoom { display: none; }
+
   /* Type filter — hide in sidebar on mobile, show as map overlay */
   .side-body .type-filter { display: none; }
   .m-type-strip {
@@ -1638,7 +1650,13 @@ input, textarea, select { font-family: inherit; color: inherit; }
   .m-type-strip .type-chips::-webkit-scrollbar { display: none; }
   .m-type-strip .type-chip {
     flex-shrink: 0; height: 32px; padding: 0 var(--s-3);
-    background: var(--bg-card); box-shadow: var(--shadow-sm);
+    box-shadow: var(--shadow-sm);
+  }
+  .m-type-strip .type-chip:not(.active) {
+    background: var(--bg-card);
+  }
+  .m-type-strip .type-chip.active {
+    background: var(--ink); color: var(--bg-card); border-color: var(--ink);
   }
 
   /* Bottom action bar — search · FAB · traveller chip */
@@ -1648,9 +1666,8 @@ input, textarea, select { font-family: inherit; color: inherit; }
     gap: var(--s-3);
     z-index: var(--z-overlay);
     padding-bottom: var(--m-safe-bottom);
-    pointer-events: none;
   }
-  .m-actionbar > * { pointer-events: auto; box-shadow: var(--shadow-md); }
+  .m-actionbar > * { box-shadow: var(--shadow-md); }
 
   .m-search {
     height: var(--touch-comfy); border-radius: var(--r-full);

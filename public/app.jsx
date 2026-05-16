@@ -722,6 +722,7 @@ function App() {
               onAdd={addUser}
               onRemove={removeUser}
               onRename={renameUser}
+              onLogout={handleLogout}
               userId={authUser?.id}
             />
           ) : (
@@ -990,7 +991,7 @@ function countByType(cities) {
 }
 
 // === User Switcher ===
-function UserSwitcher({ tr, users, currentUser, open, onToggle, onClose, onSwitch, onAdd, onRemove, onRename, userId }) {
+function UserSwitcher({ tr, users, currentUser, open, onToggle, onClose, onSwitch, onAdd, onRemove, onRename, onLogout, userId }) {
   const [renaming, setRenaming] = useState(null);
   const [newName, setNewName] = useState("");
   // Sharing panel state
@@ -1170,6 +1171,9 @@ function UserSwitcher({ tr, users, currentUser, open, onToggle, onClose, onSwitc
             const name = prompt(tr('travellerName') + ':', '');
             if (name && name.trim()) onAdd(name.trim());
           }}>+ {tr('addTraveller')}</button>
+          {onLogout && (
+            <button className="user-signout-btn" onClick={() => { onClose(); onLogout(); }}>⏻ Sign out</button>
+          )}
         </div>
       )}
     </div>
